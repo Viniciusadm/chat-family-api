@@ -7,6 +7,7 @@ use sqlx::{MySqlPool, Row};
 use uuid::Uuid;
 
 const EXPO_URL: &str = "https://exp.host/--/api/v2/push/send";
+const EXPO_MAX_MESSAGES_PER_REQUEST: usize = 100;
 
 #[derive(Clone)]
 pub struct ExpoPush {
@@ -111,36 +112,39 @@ impl ExpoPush {
             }
         }
 
-        let messages: Vec<Value> = tokens
-            .iter()
-            .map(|token| {
-                json!({
-                    "to": token,
-                    "data": data,
-                    "priority": "high",
-                    "_contentAvailable": true,
-                })
-            })
-            .collect();
-
-        let mut request = self.client.post(EXPO_URL).json(&messages);
-        if let Some(token) = &self.access_token {
-            request = request.bearer_auth(token);
-        }
-        let resp = request.send().await?.error_for_status()?;
-        let body: ExpoResponse = resp.json().await?;
-
         let mut invalid_tokens: Vec<String> = Vec::new();
-        for (idx, ticket) in body.data.iter().enumerate() {
-            if ticket.status.as_deref() == Some("error") {
+        for chunk in tokens.chunks(EXPO_MAX_MESSAGES_PER_REQUEST) {
+            let messages: Vec<Value> = chunk
+                .iter()
+                .map(|token| {
+                    json!({
+                        "to": token,
+                        "data": data,
+                        "priority": "high",
+                        "_contentAvailable": true,
+                    })
+                })
+                .collect();
+
+            let mut request = self.client.post(EXPO_URL).json(&messages);
+            if let Some(token) = &self.access_token {
+                request = request.bearer_auth(token);
+            }
+            let resp = request.send().await?.error_for_status()?;
+            let body: ExpoResponse = resp.json().await?;
+
+            for (idx, ticket) in body.data.iter().enumerate() {
+                if ticket.status.as_deref() != Some("error") {
+                    continue;
+                }
                 let code = ticket
                     .details
                     .as_ref()
                     .and_then(|d| d.get("error"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if code == "DeviceNotRegistered" || code == "InvalidCredentials" {
-                    if let Some(token) = tokens.get(idx) {
+                if code == "DeviceNotRegistered" {
+                    if let Some(token) = chunk.get(idx) {
                         invalid_tokens.push(token.clone());
                     }
                 }

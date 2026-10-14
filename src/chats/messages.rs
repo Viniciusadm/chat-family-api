@@ -10,71 +10,85 @@ use uuid::Uuid;
 use crate::{
     auth::{AuthUser, assert_chat_participant},
     error::{AppError, AppResult},
-    realtime::{emit, emit_tx},
+    realtime::{PendingEvents, emit, emit_tx},
     state::AppState,
-    utils::json_rows,
+    utils::is_unique_violation,
 };
 
-use super::dto::{MessageQuery, MessageRequest};
-
-const MYSQL_DUPLICATE_ENTRY: &str = "23000";
-
-fn is_duplicate_key(error: &sqlx::Error) -> bool {
-    matches!(
-        error,
-        sqlx::Error::Database(db) if db.code().as_deref() == Some(MYSQL_DUPLICATE_ENTRY)
-    )
-}
+use super::dto::{MESSAGE_COLUMNS, MessageQuery, MessageRequest, MessageResponse};
 
 pub(super) async fn list_messages(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(chat_id): Path<Uuid>,
     Query(query): Query<MessageQuery>,
-) -> AppResult<Json<Value>> {
+) -> AppResult<Json<Vec<MessageResponse>>> {
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     // `after` pages forward through history; `changed_after` replays every write, so a
     // client also picks up edits and soft deletes of messages older than its history
     // cursor. The two cursors need different orderings, hence the two queries.
-    let rows = match query.changed_after {
-        Some(changed_after) => {
-            sqlx::query(
+    let messages = match (query.changed_after, query.before) {
+        (Some(changed_after), _) => {
+            let sql = format!(
                 r#"
-                SELECT *, type AS kind, reply_to_type AS reply_kind
+                SELECT {MESSAGE_COLUMNS}
                 FROM messages
                 WHERE chat_id = ? AND tenant_id = ? AND updated_at > ?
                 ORDER BY updated_at ASC
                 LIMIT ?
-                "#,
-            )
-            .bind(chat_id)
-            .bind(auth.tenant_id)
-            .bind(changed_after)
-            .bind(limit)
-            .fetch_all(&state.pool)
-            .await?
+                "#
+            );
+            sqlx::query_as::<_, MessageResponse>(&sql)
+                .bind(chat_id)
+                .bind(auth.tenant_id)
+                .bind(changed_after)
+                .bind(limit)
+                .fetch_all(&state.pool)
+                .await?
         }
-        None => {
-            sqlx::query(
+        (None, Some(before)) => {
+            let sql = format!(
                 r#"
-                SELECT *, type AS kind, reply_to_type AS reply_kind
+                SELECT * FROM (
+                    SELECT {MESSAGE_COLUMNS}
+                    FROM messages
+                    WHERE chat_id = ? AND tenant_id = ? AND created_at < ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                ) AS page
+                ORDER BY created_at ASC
+                "#
+            );
+            sqlx::query_as::<_, MessageResponse>(&sql)
+                .bind(chat_id)
+                .bind(auth.tenant_id)
+                .bind(before)
+                .bind(limit)
+                .fetch_all(&state.pool)
+                .await?
+        }
+        (None, None) => {
+            let sql = format!(
+                r#"
+                SELECT {MESSAGE_COLUMNS}
                 FROM messages
                 WHERE chat_id = ? AND tenant_id = ? AND (? IS NULL OR created_at > ?)
                 ORDER BY created_at ASC
                 LIMIT ?
-                "#,
-            )
-            .bind(chat_id)
-            .bind(auth.tenant_id)
-            .bind(query.after)
-            .bind(query.after)
-            .bind(limit)
-            .fetch_all(&state.pool)
-            .await?
+                "#
+            );
+            sqlx::query_as::<_, MessageResponse>(&sql)
+                .bind(chat_id)
+                .bind(auth.tenant_id)
+                .bind(query.after)
+                .bind(query.after)
+                .bind(limit)
+                .fetch_all(&state.pool)
+                .await?
         }
     };
-    Ok(Json(json_rows(rows)))
+    Ok(Json(messages))
 }
 
 pub(super) async fn create_message(
@@ -86,6 +100,7 @@ pub(super) async fn create_message(
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
     validate_message_payload(&req)?;
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     // A plain INSERT keeps a client retry idempotent (duplicate key => already stored)
     // while letting real violations surface, unlike the previous INSERT IGNORE which
     // returned 200 for messages that were never persisted.
@@ -95,9 +110,9 @@ pub(super) async fn create_message(
             id, chat_id, tenant_id, sender_member_id, type,
             ciphertext, iv, enc_version, audio_url, audio_duration,
             image_url, thumbnail_url, image_width, image_height, image_file_size,
-            reply_to_message_id, reply_to_sender_id, reply_to_sender_name, reply_to_type, reply_to_preview
+            reply_to_message_id, reply_to_sender_id, reply_to_sender_name, reply_to_type
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(req.id)
@@ -119,14 +134,13 @@ pub(super) async fn create_message(
     .bind(req.reply_to_sender_id)
     .bind(&req.reply_to_sender_name)
     .bind(&req.reply_to_type)
-    .bind(&req.reply_to_preview)
     .execute(&mut *tx)
     .await;
 
     // A retry of an already stored message must not bump the preview or the unread
     // counters again.
     if let Err(error) = insert {
-        if is_duplicate_key(&error) {
+        if is_unique_violation(&error) {
             tx.rollback().await?;
             return Ok(Json(json!({ "id": req.id, "duplicate": true })));
         }
@@ -153,7 +167,7 @@ pub(super) async fn create_message(
 
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "message.created",
         Some(chat_id),
@@ -162,6 +176,7 @@ pub(super) async fn create_message(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
 
     let push = Arc::clone(&state.push);
     let pool = state.pool.clone();
@@ -308,7 +323,6 @@ mod tests {
             reply_to_sender_id: None,
             reply_to_sender_name: None,
             reply_to_type: None,
-            reply_to_preview: None,
         }
     }
 

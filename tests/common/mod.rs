@@ -44,6 +44,7 @@ pub async fn start() -> Option<TestServer> {
         child_login_max_attempts: 5,
         child_login_window_secs: 60,
         allowed_origins: Vec::new(),
+        trust_forwarded_for: false,
     };
 
     let state = AppState::connect(config)
@@ -68,17 +69,37 @@ impl TestServer {
         token: Option<&str>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        let (status, bytes) = match body {
+            Some(body) => {
+                self.call_raw(method, path, token, Some("application/json"), body.to_string().into_bytes())
+                    .await
+            }
+            None => self.call_raw(method, path, token, None, Vec::new()).await,
+        };
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, value)
+    }
+
+    pub async fn call_raw(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> (StatusCode, Vec<u8>) {
         let mut builder = Request::builder().method(method).uri(path);
         if let Some(token) = token {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
-        let mut request = match body {
-            Some(body) => builder
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string())),
-            None => builder.body(Body::empty()),
+        if let Some(content_type) = content_type {
+            builder = builder.header("content-type", content_type);
         }
-        .expect("build request");
+        let mut request = builder.body(Body::from(body)).expect("build request");
         // The unauthenticated handlers extract ConnectInfo, which oneshot does not populate.
         request
             .extensions_mut()
@@ -94,12 +115,34 @@ impl TestServer {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read response body");
-        let value = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        (status, value)
+        (status, bytes.to_vec())
+    }
+
+    pub async fn upload(
+        &self,
+        path: &str,
+        token: &str,
+        file_name: &str,
+        file_content_type: &str,
+        file: &[u8],
+    ) -> (StatusCode, Value) {
+        let boundary = format!("boundary-{}", Uuid::new_v4().simple());
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: {file_content_type}\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(file);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let (status, bytes) = self
+            .call_raw(
+                "POST",
+                path,
+                Some(token),
+                Some(&format!("multipart/form-data; boundary={boundary}")),
+                body,
+            )
+            .await;
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
     pub async fn get(&self, path: &str, token: &str) -> (StatusCode, Value) {
@@ -136,17 +179,47 @@ pub struct Family {
 impl Family {
     /// Removing the tenant cascades to every row seeded here, so tests can share a database.
     pub async fn cleanup(&self, server: &TestServer) {
-        sqlx::query("UPDATE tenants SET owner_user_id = NULL WHERE id = ?")
-            .bind(self.tenant_id)
-            .execute(&server.state.pool)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM tenants WHERE id = ?")
-            .bind(self.tenant_id)
-            .execute(&server.state.pool)
-            .await
-            .ok();
+        delete_tenant(server, self.tenant_id).await;
     }
+}
+
+pub async fn delete_tenant(server: &TestServer, tenant_id: Uuid) {
+    let pool = &server.state.pool;
+    let storage_paths: Vec<String> =
+        sqlx::query_scalar("SELECT storage_path FROM media_files WHERE tenant_id = ?")
+            .bind(tenant_id)
+            .fetch_all(pool)
+            .await
+            .expect("list media files");
+    for storage_path in &storage_paths {
+        server.state.storage.delete_relative(storage_path).await;
+    }
+
+    let statements = [
+        "UPDATE tenants SET owner_user_id = NULL WHERE id = ?",
+        "DELETE FROM media_files WHERE tenant_id = ?",
+        r#"
+        DELETE ks FROM key_shares ks
+        JOIN members m ON m.id = ks.wrapped_by_member_id
+        WHERE m.tenant_id = ?
+        "#,
+        "DELETE FROM messages WHERE tenant_id = ?",
+        "DELETE FROM tenants WHERE id = ?",
+    ];
+    for statement in statements {
+        sqlx::query(statement)
+            .bind(tenant_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("cleanup of tenant {tenant_id} failed: {error}"));
+    }
+
+    let leftover: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members WHERE tenant_id = ?")
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await
+        .expect("count leftover members");
+    assert_eq!(leftover, 0, "tenant {tenant_id} was not fully removed");
 }
 
 pub async fn seed_member(server: &TestServer, tenant_id: Uuid, role: Role) -> Actor {

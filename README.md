@@ -11,7 +11,7 @@ Backend of Chat Family, a closed group messenger where the server carries the co
 
 Text messages are end-to-end encrypted. The `messages` table stores `ciphertext`, `iv` and `enc_version`, and a `CHECK` constraint refuses a text message without them unless it is deleted. The rule lives in the database, so neither a route bug nor a manual `INSERT` can store plain text.
 
-Audio and images are not. Files are written as they arrive and served by `GET /static/{path}`, protected by authorization (valid token, same tenant and chat membership checked on every download), but the server can open them.
+Audio and images are not. Audio is written as it arrives; images are decoded and re-encoded first, which applies the EXIF orientation and drops every metadata block (GPS, device, time). Files are served by `GET /static/{path}`, protected by authorization (valid token, same tenant and chat membership checked on every download), but the server can open them.
 
 ## How keys move
 
@@ -19,6 +19,8 @@ Each chat has a symmetric key that only exists on devices. The server stores two
 
 - `key_shares`: the chat key wrapped by one device for another device's public key, with an ephemeral public key per share. Only the target device's private key opens it. `wrapped_by_member_id` is `ON DELETE RESTRICT`, so the record of who gave access to whom cannot be deleted with the member.
 - `key_backups`: one blob per `(user_id, chat_id)`, encrypted with a key derived from the user's password. The server keeps the password salt and an encrypted verifier, never the password or the key. This restores conversations on a new device without another device being online.
+
+Only one device creates a chat key. Before generating one, a device calls `POST /chats/{id}/key-claim`; the first device gets `granted: true` and later callers adopt its key from their key shares. A claim older than 10 minutes with no share or backup written can be taken over. A key share only targets an active device of a chat participant, and a share wrapped by another member is never overwritten. When a member leaves a group or is deleted, the server deletes their shares and backups for it; the key itself is not rotated, so the devices they already had keep it.
 
 ## Accounts and devices
 
@@ -38,7 +40,7 @@ CORS uses an explicit origin list. Native clients send no `Origin` and are not a
 
 ## Realtime
 
-`GET /realtime` upgrades to a WebSocket and delivers live events. A client that reconnects reads what it missed from `GET /realtime/events`, which returns the append-only `realtime_events` log from a cursor. A task prunes events older than 7 days every hour, in batches of 5,000 rows.
+`GET /realtime` upgrades to a WebSocket and delivers live events. A client that reconnects reads what it missed from `GET /realtime/events`, which returns the append-only `realtime_events` log from a cursor. Events are published to the WebSocket only after their transaction commits, on a channel per tenant. The socket closes when its access token expires, so the client reconnects with a fresh one. A task prunes events older than 7 days every hour, in batches of 5,000 rows.
 
 ## Requirements
 
@@ -76,6 +78,7 @@ It listens on `127.0.0.1:3000`. Set `BIND_ADDR=0.0.0.0:3000` to reach it from a 
 | `EXPO_ACCESS_TOKEN` | no | empty | Push notifications through Expo |
 | `CHILD_LOGIN_MAX_ATTEMPTS` | no | `5` | Child login attempts per window |
 | `CHILD_LOGIN_WINDOW_SECS` | no | `60` | Window size in seconds |
+| `TRUST_FORWARDED_FOR` | behind a proxy | `false` | Take the client address for rate limiting from the last `X-Forwarded-For` entry |
 
 ## API
 
@@ -86,10 +89,10 @@ It listens on `127.0.0.1:3000`. Set `BIND_ADDR=0.0.0.0:3000` to reach it from a 
 | Admin | `GET /admin/devices/pending` `/admin/devices/key-recipients`, `POST /admin/devices/{id}/approve`, `DELETE /admin/devices/{id}` |
 | Members | `GET POST /members`, `PATCH DELETE /members/{id}`, `DELETE /members/{id}/photo` |
 | Chats | `GET POST /chats`, `GET PATCH DELETE /chats/{id}`, `DELETE /chats/{id}/photo`, `POST /chats/{id}/read` |
-| Messages | `GET POST /chats/{id}/messages`, `PATCH DELETE /chats/{id}/messages/{id}` |
+| Messages | `GET POST /chats/{id}/messages` (`?after=`, `?before=`, `?changed_after=`), `PATCH DELETE /chats/{id}/messages/{id}` |
 | Reactions | `GET /chats/{id}/reactions`, `PUT DELETE /chats/{id}/messages/{id}/reaction` |
-| Media | `POST /media/profile-photo`, `POST /chats/{id}/photo/upload`, `POST /chats/{chat}/messages/{message}/audio`, `POST /chats/{chat}/messages/{message}/image`, `GET /static/{path}` |
-| Keys | `GET PUT DELETE /crypto/password-settings`, `GET DELETE /crypto/key-backups`, `PUT /crypto/key-backups/{chat}`, `GET /devices/{device}/key-shares`, `PUT /devices/{device}/key-shares/{chat}`, `GET /chats/{chat}/key-recipients`, `PUT /chats/{chat}/devices/{device}/key-shares` |
+| Media | `POST DELETE /media/profile-photo`, `POST /chats/{id}/photo/upload`, `POST /chats/{chat}/messages/{message}/audio`, `POST /chats/{chat}/messages/{message}/image`, `GET /static/{path}` |
+| Keys | `GET PUT DELETE /crypto/password-settings`, `GET DELETE /crypto/key-backups`, `PUT /crypto/key-backups/{chat}`, `GET /devices/{device}/key-shares`, `PUT /devices/{device}/key-shares/{chat}`, `GET /chats/{chat}/key-recipients`, `PUT /chats/{chat}/devices/{device}/key-shares`, `POST /chats/{chat}/key-claim` |
 | Realtime | `GET /realtime` (WebSocket), `GET /realtime/events` |
 | Health | `GET /health` |
 
@@ -126,7 +129,7 @@ cargo test
 The API tests in `tests/api.rs` are `#[ignore]` and read a separate `DATABASE_URL_TEST`, so a test run never points at the real database:
 
 ```bash
-DATABASE_URL_TEST=mysql://user:pass@localhost:3306/chat_back_test cargo test -- --ignored
+DATABASE_URL_TEST=mysql://user:pass@localhost:3306/chat_back_test cargo test -- --include-ignored
 ```
 
-The unit tests cover message payload validation, media path resolution and the rate limit buckets. The API tests run against a real MySQL and cover the message history cursor, child permissions on chats, read state, member deletion and direct chat deduplication.
+The unit tests cover message payload validation, media path resolution and the rate limit buckets. The API tests run against a real MySQL and cover registration, login and `/auth/me`, refresh token rotation and logout, child login with a pending device, tenant isolation, media download authorization, realtime event filtering, the message history cursor, child permissions on chats, read state, member deletion and direct chat deduplication. `--include-ignored` runs the unit tests and the API tests together.

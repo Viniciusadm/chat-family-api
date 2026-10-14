@@ -7,31 +7,43 @@ use uuid::Uuid;
 
 use crate::{
     auth::{AuthUser, assert_chat_participant},
-    error::AppResult,
+    error::{AppError, AppResult},
     realtime::emit,
     state::AppState,
-    utils::json_rows,
 };
 
-use super::dto::{MessageQuery, ReactionRequest};
+use super::dto::{MessageQuery, ReactionRequest, ReactionResponse};
+
+const MAX_EMOJI_CHARS: usize = 16;
 
 pub(super) async fn list_reactions(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(chat_id): Path<Uuid>,
     Query(query): Query<MessageQuery>,
-) -> AppResult<Json<Value>> {
+) -> AppResult<Json<Vec<ReactionResponse>>> {
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
-    let rows = sqlx::query(
-        "SELECT * FROM message_reactions WHERE chat_id = ? AND (? IS NULL OR updated_at > ?) ORDER BY updated_at DESC LIMIT ?",
-    )
-    .bind(chat_id)
-    .bind(query.after)
-    .bind(query.after)
-    .bind(query.limit.unwrap_or(500).clamp(1, 1000))
-    .fetch_all(&state.pool)
-    .await?;
-    Ok(Json(json_rows(rows)))
+    let reactions = match query.after {
+        Some(after) => {
+            sqlx::query_as::<_, ReactionResponse>(
+                "SELECT message_id, member_id, chat_id, emoji, updated_at FROM message_reactions WHERE chat_id = ? AND updated_at > ? ORDER BY updated_at ASC LIMIT ?",
+            )
+            .bind(chat_id)
+            .bind(after)
+            .bind(query.limit.unwrap_or(500).clamp(1, 1000))
+            .fetch_all(&state.pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as::<_, ReactionResponse>(
+                "SELECT message_id, member_id, chat_id, emoji, updated_at FROM message_reactions WHERE chat_id = ? ORDER BY updated_at ASC",
+            )
+                .bind(chat_id)
+                .fetch_all(&state.pool)
+                .await?
+        }
+    };
+    Ok(Json(reactions))
 }
 
 pub(super) async fn upsert_reaction(
@@ -41,6 +53,22 @@ pub(super) async fn upsert_reaction(
     Json(req): Json<ReactionRequest>,
 ) -> AppResult<Json<Value>> {
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
+    let emoji = req.emoji.trim();
+    if emoji.is_empty() || emoji.chars().count() > MAX_EMOJI_CHARS {
+        return Err(AppError::BadRequest("invalid emoji".into()));
+    }
+    let message_in_chat = sqlx::query(
+        "SELECT 1 FROM messages WHERE id = ? AND chat_id = ? AND tenant_id = ? AND is_deleted = false",
+    )
+    .bind(message_id)
+    .bind(chat_id)
+    .bind(auth.tenant_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .is_some();
+    if !message_in_chat {
+        return Err(AppError::NotFound("message not found".into()));
+    }
     sqlx::query(
         r#"
         INSERT INTO message_reactions (message_id, member_id, chat_id, emoji)
@@ -51,7 +79,7 @@ pub(super) async fn upsert_reaction(
     .bind(message_id)
     .bind(auth.member_id)
     .bind(chat_id)
-    .bind(&req.emoji)
+    .bind(emoji)
     .execute(&state.pool)
     .await?;
     emit(
@@ -61,7 +89,7 @@ pub(super) async fn upsert_reaction(
         "reaction.updated",
         Some(chat_id),
         Some(message_id),
-        json!({"member_id": auth.member_id, "emoji": req.emoji}),
+        json!({"member_id": auth.member_id, "emoji": emoji}),
     )
     .await?;
     Ok(Json(json!({ "ok": true })))

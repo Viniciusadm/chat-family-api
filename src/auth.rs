@@ -151,6 +151,14 @@ pub async fn assert_chat_participant(
     }
 }
 
+const RATE_LIMIT_SCRIPT: &str = r"
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+";
+
 pub async fn rate_limit(
     redis: Option<&redis::Client>,
     key: &str,
@@ -167,20 +175,18 @@ pub async fn rate_limit(
             return Ok(());
         }
     };
-    let count: i64 = match redis::cmd("INCR").arg(key).query_async(&mut conn).await {
+    let count: i64 = match redis::Script::new(RATE_LIMIT_SCRIPT)
+        .key(key)
+        .arg(window_secs)
+        .invoke_async(&mut conn)
+        .await
+    {
         Ok(value) => value,
         Err(err) => {
             tracing::warn!(?err, "rate limit incr failed, allowing");
             return Ok(());
         }
     };
-    if count == 1 {
-        let _: Result<(), _> = redis::cmd("EXPIRE")
-            .arg(key)
-            .arg(window_secs)
-            .query_async(&mut conn)
-            .await;
-    }
     if count as u32 > max_attempts {
         return Err(AppError::TooManyRequests);
     }

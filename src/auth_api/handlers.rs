@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use axum::{
     Json,
     extract::{ConnectInfo, State},
+    http::HeaderMap,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -12,8 +13,9 @@ use crate::{
     auth::{AuthUser, Role, hash_password, hash_refresh_token, rate_limit, verify_password},
     devices::activate_device,
     error::{AppError, AppResult},
-    realtime::{emit, emit_tx},
+    realtime::{PendingEvents, emit, emit_tx},
     state::AppState,
+    utils::is_unique_violation,
 };
 
 use super::dto::{
@@ -42,17 +44,32 @@ fn login_rate_limit_buckets(
     ]
 }
 
+fn client_ip(state: &AppState, peer: &SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if !state.config.trust_forwarded_for {
+        return peer.ip();
+    }
+    headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .last()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| peer.ip())
+}
+
 /// Limits an unauthenticated attempt both by its own subject (email, device, token) and by
 /// the calling address, so neither a single target nor a single source can be hammered.
 async fn enforce_login_rate_limit(
     state: &AppState,
     peer: &SocketAddr,
+    headers: &HeaderMap,
     subject: &[&str],
 ) -> AppResult<()> {
     let window_secs = state.config.child_login_window_secs;
     let buckets = login_rate_limit_buckets(
         subject,
-        peer.ip(),
+        client_ip(state, peer, headers),
         state.config.child_login_max_attempts,
     );
     for (bucket, limit) in buckets {
@@ -64,6 +81,7 @@ async fn enforce_login_rate_limit(
 pub(super) async fn register(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> AppResult<Json<TokenResponse>> {
     if req.email.trim().is_empty() || req.password.len() < 8 || req.name.trim().is_empty() {
@@ -73,7 +91,7 @@ pub(super) async fn register(
     }
 
     let email = req.email.trim().to_lowercase();
-    enforce_login_rate_limit(&state, &peer, &["register", &email]).await?;
+    enforce_login_rate_limit(&state, &peer, &headers, &["register", &email]).await?;
     tracing::debug!(email = %email, "register: checking existing email");
     let email_exists = sqlx::query_scalar::<_, i64>(
         "SELECT 1 FROM users WHERE email = ? AND deleted_at IS NULL LIMIT 1",
@@ -90,6 +108,7 @@ pub(super) async fn register(
         return Err(AppError::Conflict("email already registered".into()));
     }
 
+    let password_hash = hash_password(req.password.clone()).await?;
     tracing::debug!(email = %email, "register: starting transaction");
     let mut tx = state.pool.begin().await?;
     let tenant_id = Uuid::new_v4();
@@ -117,7 +136,6 @@ pub(super) async fn register(
             error
         })?;
 
-    let password_hash = hash_password(req.password.clone()).await?;
     let user_id = Uuid::new_v4();
     tracing::debug!(%tenant_id, %member_id, %user_id, email = %email, "register: inserting user");
     sqlx::query(
@@ -135,7 +153,7 @@ pub(super) async fn register(
     .execute(&mut *tx)
     .await
     .map_err(|error| match error {
-        sqlx::Error::Database(db_error) if db_error.code().as_deref() == Some("1062") => {
+        error if is_unique_violation(&error) => {
             AppError::Conflict("email already registered".into())
         }
         other => AppError::Database(other),
@@ -191,10 +209,11 @@ pub(super) async fn register(
 pub(super) async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> AppResult<Json<TokenResponse>> {
     let email = req.email.trim().to_lowercase();
-    enforce_login_rate_limit(&state, &peer, &["email", &email]).await?;
+    enforce_login_rate_limit(&state, &peer, &headers, &["email", &email]).await?;
     let row = sqlx::query(
         r#"
         SELECT id, member_id, tenant_id, password_hash, name, role AS role, email
@@ -219,6 +238,7 @@ pub(super) async fn login(
     let member_id: Uuid = row.try_get("member_id")?;
 
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     activate_device(
         &mut tx,
         tenant_id,
@@ -231,7 +251,7 @@ pub(super) async fn login(
     .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         tenant_id,
         "device.updated",
         None,
@@ -240,6 +260,7 @@ pub(super) async fn login(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
 
     let role_str: String = row.try_get("role")?;
     issue_tokens(
@@ -260,12 +281,13 @@ pub(super) async fn login(
 pub(super) async fn child_login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ChildLoginRequest>,
 ) -> AppResult<Json<TokenResponse>> {
     let code = req.code.trim().to_string();
     // The code must never be part of the bucket key: an attacker cycling codes would
     // get a fresh counter on every attempt and never hit the limit.
-    enforce_login_rate_limit(&state, &peer, &["device", &req.device_id.to_string()]).await?;
+    enforce_login_rate_limit(&state, &peer, &headers, &["device", &req.device_id.to_string()]).await?;
 
     let row = sqlx::query(
         r#"
@@ -281,6 +303,7 @@ pub(super) async fn child_login(
     .ok_or(AppError::Unauthorized)?;
 
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     let tenant_id: Uuid = row.try_get("tenant_id")?;
     let member_id: Uuid = row.try_get("member_id")?;
     let name: String = row.try_get("name")?;
@@ -332,7 +355,7 @@ pub(super) async fn child_login(
     .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         tenant_id,
         "device.updated",
         None,
@@ -341,6 +364,7 @@ pub(super) async fn child_login(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
 
     issue_tokens(
         &state,
@@ -360,12 +384,13 @@ pub(super) async fn child_login(
 pub(super) async fn refresh(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<RefreshRequest>,
 ) -> AppResult<Json<TokenResponse>> {
     // The token hash is the subject being attacked here; anything shared between callers
     // would let one device's refresh cadence lock every other device out.
     let token_hash = hash_refresh_token(&req.refresh_token);
-    enforce_login_rate_limit(&state, &peer, &["refresh", &token_hash]).await?;
+    enforce_login_rate_limit(&state, &peer, &headers, &["refresh", &token_hash]).await?;
 
     // Select and revoke in one transaction with the row locked, so two concurrent
     // refreshes with the same token cannot both mint a new token family.
@@ -380,7 +405,16 @@ pub(super) async fn refresh(
           AND rt.revoked_at IS NULL
           AND rt.expires_at > now()
           AND u.deleted_at IS NULL
-          AND (rt.device_id IS NULL OR (d.approved = true AND d.active = true))
+          AND (
+            rt.device_id IS NULL
+            OR (
+              d.user_id = rt.user_id
+              AND (
+                (d.approved = true AND d.active = true)
+                OR (d.approved = false AND d.deactivation_reason IS NULL)
+              )
+            )
+          )
         FOR UPDATE
         "#,
     )

@@ -1,7 +1,10 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use axum::http::{HeaderValue, Method, header};
+use axum::{
+    extract::Request,
+    http::{HeaderValue, Method, header},
+};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -61,7 +64,13 @@ async fn main() -> anyhow::Result<()> {
 
     let app = app::router(state.clone())
         .layer(cors_layer(&state.config)?)
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &Request| {
+            tracing::debug_span!(
+                "request",
+                method = %request.method(),
+                path = %request.uri().path(),
+            )
+        }));
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!("listening on http://{bind_addr}");

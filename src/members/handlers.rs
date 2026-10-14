@@ -8,25 +8,27 @@ use uuid::Uuid;
 
 use crate::{
     auth::{AuthUser, Role, require_adult},
+    crypto_api::revoke_chat_key_access,
     error::{AppError, AppResult},
-    realtime::{emit, emit_tx},
+    realtime::{PendingEvents, emit, emit_tx},
     state::AppState,
-    utils::{generate_login_code, json_rows},
+    utils::generate_login_code,
 };
 
-use super::dto::MemberRequest;
+use super::dto::{MemberRequest, MemberResponse};
 
 pub(super) async fn list_members(
     State(state): State<AppState>,
     auth: AuthUser,
-) -> AppResult<Json<Value>> {
-    let rows = sqlx::query(
-        "SELECT id, name, role AS role, login_code, photo_url, photo_path, created_at FROM members WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at",
+) -> AppResult<Json<Vec<MemberResponse>>> {
+    let members = sqlx::query_as::<_, MemberResponse>(
+        "SELECT id, name, role AS role, CASE WHEN ? THEN login_code END AS login_code, photo_url, photo_path, created_at FROM members WHERE tenant_id = ? AND deleted_at IS NULL ORDER BY created_at",
     )
+    .bind(auth.role == Role::Adult)
     .bind(auth.tenant_id)
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(json_rows(rows)))
+    Ok(Json(members))
 }
 
 pub(super) async fn create_member(
@@ -47,6 +49,7 @@ pub(super) async fn create_member(
     };
 
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     let member_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO members (id, tenant_id, name, role, login_code) VALUES (?, ?, ?, ?, ?)",
@@ -75,7 +78,7 @@ pub(super) async fn create_member(
     let new_chat_ids = create_direct_chats_for_member(&mut tx, auth.tenant_id, member_id).await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "member.updated",
         None,
@@ -86,7 +89,7 @@ pub(super) async fn create_member(
     for chat_id in &new_chat_ids {
         emit_tx(
             &mut tx,
-            &state.hub,
+            &mut events,
             auth.tenant_id,
             "chat.created",
             Some(*chat_id),
@@ -96,6 +99,7 @@ pub(super) async fn create_member(
         .await?;
     }
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "id": member_id, "login_code": login_code })))
 }
 
@@ -173,7 +177,31 @@ pub(super) async fn delete_member(
     Path(member_id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
     require_adult(&auth)?;
+    if member_id == auth.member_id {
+        return Err(AppError::BadRequest("a member cannot delete themselves".into()));
+    }
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
+    let role: String = sqlx::query_scalar(
+        "SELECT role FROM members WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(member_id)
+    .bind(auth.tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::NotFound("member not found".into()))?;
+    if role == Role::Adult.as_db() {
+        let other_adults: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM members WHERE tenant_id = ? AND role = 'adult' AND deleted_at IS NULL AND id <> ?",
+        )
+        .bind(auth.tenant_id)
+        .bind(member_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if other_adults == 0 {
+            return Err(AppError::BadRequest("the last adult cannot be deleted".into()));
+        }
+    }
     let user_ids = sqlx::query("SELECT id FROM users WHERE member_id = ? AND tenant_id = ?")
         .bind(member_id)
         .bind(auth.tenant_id)
@@ -186,7 +214,7 @@ pub(super) async fn delete_member(
             .execute(&mut *tx)
             .await?;
     }
-    sqlx::query("UPDATE users SET deleted_at = now() WHERE member_id = ? AND tenant_id = ?")
+    sqlx::query("UPDATE users SET deleted_at = now(), email = NULL WHERE member_id = ? AND tenant_id = ?")
         .bind(member_id)
         .bind(auth.tenant_id)
         .execute(&mut *tx)
@@ -204,9 +232,10 @@ pub(super) async fn delete_member(
         .bind(member_id)
         .execute(&mut *tx)
         .await?;
+    revoke_chat_key_access(&mut tx, None, member_id).await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "member.updated",
         None,
@@ -215,6 +244,7 @@ pub(super) async fn delete_member(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "ok": true })))
 }
 

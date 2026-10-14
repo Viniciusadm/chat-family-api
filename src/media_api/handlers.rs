@@ -14,7 +14,7 @@ use crate::{
     auth::{AuthUser, assert_chat_participant, require_adult},
     error::{AppError, AppResult},
     media::{MediaKind, audio_dir, group_photo_dir, image_dir, profile_photo_dir},
-    realtime::{emit, emit_tx},
+    realtime::{PendingEvents, emit, emit_tx},
     state::AppState,
 };
 
@@ -95,6 +95,7 @@ pub(super) async fn upload_profile_photo(
         .await?;
 
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     let previous_user: Option<String> =
         sqlx::query_scalar("SELECT photo_path FROM users WHERE id = ?")
             .bind(auth.user_id)
@@ -132,7 +133,7 @@ pub(super) async fn upload_profile_photo(
     .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "member.updated",
         None,
@@ -141,6 +142,7 @@ pub(super) async fn upload_profile_photo(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     cleanup_old(&state.storage, previous_user.as_deref()).await;
     cleanup_old(&state.storage, previous_member.as_deref()).await;
 
@@ -210,6 +212,7 @@ pub(super) async fn upload_chat_photo(
         .await?;
 
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     let previous: Option<String> =
         sqlx::query_scalar("SELECT photo_path FROM chats WHERE id = ? AND tenant_id = ?")
             .bind(chat_id)
@@ -235,7 +238,7 @@ pub(super) async fn upload_chat_photo(
     .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "chat.updated",
         Some(chat_id),
@@ -244,6 +247,7 @@ pub(super) async fn upload_chat_photo(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     cleanup_old(&state.storage, previous.as_deref()).await;
 
     Ok(Json(json!({
@@ -283,6 +287,7 @@ pub(super) async fn upload_message_audio(
     );
 
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     sqlx::query(
         "UPDATE messages SET audio_url = ? WHERE id = ? AND chat_id = ? AND sender_member_id = ?",
     )
@@ -304,7 +309,7 @@ pub(super) async fn upload_message_audio(
     .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "message.updated",
         Some(chat_id),
@@ -313,6 +318,7 @@ pub(super) async fn upload_message_audio(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({
         "url": saved.public_url,
         "path": saved.storage_path,
@@ -344,6 +350,7 @@ pub(super) async fn upload_message_image(
         .await?;
 
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     sqlx::query(
         r#"
         UPDATE messages
@@ -372,7 +379,7 @@ pub(super) async fn upload_message_image(
     .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "message.updated",
         Some(chat_id),
@@ -381,6 +388,7 @@ pub(super) async fn upload_message_image(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({
         "url": saved.public_url,
         "path": saved.storage_path,

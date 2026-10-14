@@ -10,13 +10,14 @@ use uuid::Uuid;
 
 use crate::{
     auth::{AuthUser, Claims, require_adult},
+    crypto_api::KeyRecipientDevice,
     error::{AppError, AppResult},
-    realtime::emit_tx,
+    realtime::{PendingEvents, emit_tx},
     state::AppState,
-    utils::json_rows,
+    utils::is_unique_violation,
 };
 
-use super::dto::{DeviceRequest, KeyRecipientQuery};
+use super::dto::{DeviceRequest, KeyRecipientQuery, PendingDeviceResponse};
 
 pub(crate) async fn activate_device(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -45,6 +46,11 @@ pub(crate) async fn activate_device(
         // handing the hardware to another member must not inherit it.
         if row.try_get::<Uuid, _>("user_id")? == user_id {
             effective_approved = approved || row.try_get::<bool, _>("approved")?;
+        } else {
+            sqlx::query("DELETE FROM key_shares WHERE device_id = ?")
+                .bind(device_id)
+                .execute(&mut **tx)
+                .await?;
         }
     }
 
@@ -116,6 +122,7 @@ pub(super) async fn create_device(
     Json(req): Json<DeviceRequest>,
 ) -> AppResult<Json<Value>> {
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     enforce_public_key_immutability(&mut tx, req.device_id, req.public_key.as_deref()).await?;
     let result = sqlx::query(
         r#"
@@ -146,11 +153,18 @@ pub(super) async fn create_device(
         .bind(req.push_token)
         .bind(req.public_key)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                AppError::Conflict("device is registered to another user".into())
+            } else {
+                AppError::Database(error)
+            }
+        })?;
     }
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "device.updated",
         None,
@@ -159,6 +173,7 @@ pub(super) async fn create_device(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "id": req.device_id })))
 }
 
@@ -173,6 +188,7 @@ pub(super) async fn update_device(
     }
 
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     enforce_public_key_immutability(&mut tx, device_id, req.public_key.as_deref()).await?;
     sqlx::query(
         r#"
@@ -192,7 +208,7 @@ pub(super) async fn update_device(
     .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "device.updated",
         None,
@@ -201,6 +217,7 @@ pub(super) async fn update_device(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -261,9 +278,9 @@ pub(super) async fn device_status(
 pub(super) async fn pending_devices(
     State(state): State<AppState>,
     auth: AuthUser,
-) -> AppResult<Json<Value>> {
+) -> AppResult<Json<Vec<PendingDeviceResponse>>> {
     require_adult(&auth)?;
-    let rows = sqlx::query(
+    let devices = sqlx::query_as::<_, PendingDeviceResponse>(
         r#"
         SELECT d.id, d.user_id, d.created_at, d.public_key, u.name, u.member_id
         FROM devices d
@@ -275,14 +292,14 @@ pub(super) async fn pending_devices(
     .bind(auth.tenant_id)
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(json_rows(rows)))
+    Ok(Json(devices))
 }
 
 pub(super) async fn key_recipient_devices(
     State(state): State<AppState>,
     auth: AuthUser,
     Query(query): Query<KeyRecipientQuery>,
-) -> AppResult<Json<Value>> {
+) -> AppResult<Json<Vec<KeyRecipientDevice>>> {
     require_adult(&auth)?;
     let member_ids = query
         .member_ids
@@ -291,7 +308,7 @@ pub(super) async fn key_recipient_devices(
         .filter_map(|value| Uuid::parse_str(value.trim()).ok())
         .collect::<std::collections::HashSet<_>>();
     if member_ids.is_empty() {
-        return Ok(Json(Value::Array(Vec::new())));
+        return Ok(Json(Vec::new()));
     }
 
     let placeholders = vec!["?"; member_ids.len()].join(",");
@@ -302,18 +319,19 @@ pub(super) async fn key_recipient_devices(
         JOIN users u ON u.id = d.user_id AND u.deleted_at IS NULL
         WHERE d.tenant_id = ?
           AND d.approved = true
+          AND d.active = true
           AND d.public_key IS NOT NULL
           AND u.member_id IN ({placeholders})
         ORDER BY d.created_at DESC
         "#
     );
-    let mut request = sqlx::query(&sql).bind(auth.tenant_id);
+    let mut request = sqlx::query_as::<_, KeyRecipientDevice>(&sql).bind(auth.tenant_id);
     for member_id in &member_ids {
         request = request.bind(member_id);
     }
-    let rows = request.fetch_all(&state.pool).await?;
+    let devices = request.fetch_all(&state.pool).await?;
 
-    Ok(Json(json_rows(rows)))
+    Ok(Json(devices))
 }
 
 pub(super) async fn approve_device(
@@ -330,6 +348,7 @@ pub(super) async fn approve_device(
         .ok_or(AppError::NotFound("device not found".into()))?;
     let user_id: Uuid = row.try_get("user_id")?;
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     sqlx::query("UPDATE devices SET active = false, deactivation_reason = 'new_active_device' WHERE user_id = ? AND id <> ?")
         .bind(user_id)
         .bind(device_id)
@@ -341,7 +360,7 @@ pub(super) async fn approve_device(
         .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "device.updated",
         None,
@@ -350,6 +369,7 @@ pub(super) async fn approve_device(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -360,6 +380,7 @@ pub(super) async fn delete_device(
 ) -> AppResult<Json<Value>> {
     require_adult(&auth)?;
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     sqlx::query("UPDATE devices SET active = false, deactivation_reason = 'admin_removed' WHERE id = ? AND tenant_id = ?")
         .bind(device_id)
         .bind(auth.tenant_id)
@@ -367,7 +388,7 @@ pub(super) async fn delete_device(
         .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "device.updated",
         None,
@@ -376,5 +397,6 @@ pub(super) async fn delete_device(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "ok": true })))
 }

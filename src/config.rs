@@ -18,6 +18,7 @@ pub struct Config {
     pub child_login_max_attempts: u32,
     pub child_login_window_secs: u64,
     pub allowed_origins: Vec<String>,
+    pub trust_forwarded_for: bool,
 }
 
 impl Config {
@@ -64,6 +65,8 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
+            trust_forwarded_for: non_empty("TRUST_FORWARDED_FOR")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1"),
         })
     }
 }

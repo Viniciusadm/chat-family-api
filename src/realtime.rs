@@ -1,4 +1,8 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     extract::{
@@ -23,10 +27,11 @@ use crate::{
     state::AppState,
 };
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
 pub struct RealtimeEvent {
     pub id: Uuid,
     #[serde(rename = "type")]
+    #[sqlx(rename = "type")]
     pub event_type: String,
     pub tenant_id: Uuid,
     pub chat_id: Option<Uuid>,
@@ -35,29 +40,32 @@ pub struct RealtimeEvent {
     pub payload: Value,
 }
 
-#[derive(Clone)]
+const TENANT_CHANNEL_CAPACITY: usize = 256;
+
+#[derive(Clone, Default)]
 pub struct Hub {
-    tx: broadcast::Sender<RealtimeEvent>,
+    tenants: Arc<Mutex<HashMap<Uuid, broadcast::Sender<RealtimeEvent>>>>,
 }
 
 impl Hub {
     pub fn new() -> Self {
-        let (tx, _rx) = broadcast::channel(1024);
-        Self { tx }
+        Self::default()
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<RealtimeEvent> {
-        self.tx.subscribe()
+    pub fn subscribe(&self, tenant_id: Uuid) -> broadcast::Receiver<RealtimeEvent> {
+        let mut tenants = self.tenants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        tenants.retain(|_, sender| sender.receiver_count() > 0);
+        tenants
+            .entry(tenant_id)
+            .or_insert_with(|| broadcast::channel(TENANT_CHANNEL_CAPACITY).0)
+            .subscribe()
     }
 
     fn publish(&self, event: RealtimeEvent) {
-        let _ = self.tx.send(event);
-    }
-}
-
-impl Default for Hub {
-    fn default() -> Self {
-        Self::new()
+        let tenants = self.tenants.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sender) = tenants.get(&event.tenant_id) {
+            let _ = sender.send(event);
+        }
     }
 }
 
@@ -97,9 +105,21 @@ pub fn spawn_event_retention(pool: MySqlPool) {
     });
 }
 
+#[derive(Default)]
+#[must_use = "events have to be published after the transaction commits"]
+pub struct PendingEvents(Vec<RealtimeEvent>);
+
+impl PendingEvents {
+    pub fn publish(self, hub: &Hub) {
+        for event in self.0 {
+            hub.publish(event);
+        }
+    }
+}
+
 pub async fn emit_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    hub: &Hub,
+    events: &mut PendingEvents,
     tenant_id: Uuid,
     event_type: &str,
     chat_id: Option<Uuid>,
@@ -130,7 +150,7 @@ pub async fn emit_tx(
         occurred_at,
         payload,
     };
-    hub.publish(event);
+    events.0.push(event);
     Ok(())
 }
 
@@ -144,11 +164,13 @@ pub async fn emit(
     payload: Value,
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
+    let mut events = PendingEvents::default();
     emit_tx(
-        &mut tx, hub, tenant_id, event_type, chat_id, entity_id, payload,
+        &mut tx, &mut events, tenant_id, event_type, chat_id, entity_id, payload,
     )
     .await?;
     tx.commit().await?;
+    events.publish(hub);
     Ok(())
 }
 
@@ -192,7 +214,7 @@ pub async fn realtime_handler(
 async fn connection(state: AppState, claims: Claims, socket: WebSocket) {
     let tenant_id = claims.tenant_id;
     let member_id = claims.member_id;
-    let mut rx = state.hub.subscribe();
+    let mut rx = state.hub.subscribe(tenant_id);
 
     let chats = match load_member_chats(&state.pool, tenant_id, member_id).await {
         Ok(set) => set,
@@ -215,15 +237,15 @@ async fn connection(state: AppState, claims: Claims, socket: WebSocket) {
 
     let mut device_check = tokio::time::interval(Duration::from_secs(15));
     device_check.tick().await;
+    let token_expiry = tokio::time::sleep(seconds_until(claims.exp));
+    tokio::pin!(token_expiry);
 
     loop {
         tokio::select! {
             event = rx.recv() => {
                 match event {
                     Ok(event) => {
-                        if event.tenant_id != tenant_id {
-                            continue;
-                        }
+                        let was_in_chat = event.chat_id.is_some_and(|chat_id| chats.contains(&chat_id));
                         if event.event_type == "chat.deleted" {
                             // The chat row (and its participants) are already gone, so
                             // membership is decided by the set loaded before the deletion.
@@ -231,13 +253,13 @@ async fn connection(state: AppState, claims: Claims, socket: WebSocket) {
                                 Some(deleted) if chats.remove(&deleted) => {}
                                 _ => continue,
                             }
-                        } else if event.event_type == "member.updated" || event.event_type == "chat.created" {
+                        } else if matches!(event.event_type.as_str(), "chat.created" | "chat.updated") {
                             if let Ok(set) = load_member_chats(&state.pool, tenant_id, member_id).await {
                                 chats = set;
                             }
                         }
                         if let Some(chat_id) = event.chat_id {
-                            if !chats.contains(&chat_id) {
+                            if !chats.contains(&chat_id) && !was_in_chat {
                                 continue;
                             }
                         }
@@ -259,6 +281,10 @@ async fn connection(state: AppState, claims: Claims, socket: WebSocket) {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            _ = &mut token_expiry => {
+                let _ = sender.send(Message::Close(None)).await;
+                break;
+            }
             _ = device_check.tick() => {
                 if assert_session_active(&state.pool, &claims).await.is_err() {
                     let _ = sender.send(Message::Close(None)).await;
@@ -277,6 +303,14 @@ async fn connection(state: AppState, claims: Claims, socket: WebSocket) {
             }
         }
     }
+}
+
+fn seconds_until(unix_seconds: usize) -> Duration {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Duration::from_secs((unix_seconds as u64).saturating_sub(now))
 }
 
 async fn load_member_chats(
@@ -302,4 +336,45 @@ async fn load_member_chats(
         set.insert(row.try_get::<Uuid, _>("chat_id")?);
     }
     Ok(set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_for(tenant_id: Uuid) -> RealtimeEvent {
+        RealtimeEvent {
+            id: Uuid::new_v4(),
+            event_type: "chat.updated".into(),
+            tenant_id,
+            chat_id: None,
+            entity_id: None,
+            occurred_at: Utc::now(),
+            payload: json!({}),
+        }
+    }
+
+    #[test]
+    fn a_subscriber_only_receives_its_own_tenant_events() {
+        let hub = Hub::new();
+        let tenant = Uuid::new_v4();
+        let other_tenant = Uuid::new_v4();
+        let mut rx = hub.subscribe(tenant);
+        let _other_rx = hub.subscribe(other_tenant);
+
+        hub.publish(event_for(other_tenant));
+        assert!(rx.try_recv().is_err());
+
+        let own = event_for(tenant);
+        hub.publish(own.clone());
+        assert_eq!(rx.try_recv().expect("own event").id, own.id);
+    }
+
+    #[test]
+    fn channels_without_subscribers_are_dropped() {
+        let hub = Hub::new();
+        drop(hub.subscribe(Uuid::new_v4()));
+        let _rx = hub.subscribe(Uuid::new_v4());
+        assert_eq!(hub.tenants.lock().expect("lock").len(), 1);
+    }
 }

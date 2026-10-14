@@ -4,7 +4,10 @@ use std::{
 };
 
 use axum::extract::multipart::Field;
-use image::{ImageFormat, ImageReader};
+use image::{
+    DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits,
+    codecs::{jpeg::JpegEncoder, png::PngEncoder, webp::WebPEncoder},
+};
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
@@ -120,18 +123,25 @@ impl LocalStorage {
         // The extension decides the Content-Type this file is later served with, so it
         // must never come from the client-supplied filename. For images the real format
         // is sniffed from the bytes; for audio the allowlisted content-type is the source.
-        let (extension, width, height) = match kind {
+        let (bytes, content_type, extension, width, height) = match kind {
             MediaKind::MessageImage | MediaKind::ProfilePhoto | MediaKind::GroupPhoto => {
-                let (format, dimensions) = inspect_image(&bytes).ok_or_else(|| {
-                    AppError::BadRequest("upload is not a valid image".into())
-                })?;
-                let extension = image_extension(format).ok_or_else(|| {
-                    AppError::BadRequest(format!("unsupported image format {format:?}"))
-                })?;
-                (extension, Some(dimensions.0), Some(dimensions.1))
+                let image = tokio::task::spawn_blocking(move || sanitize_image(&bytes))
+                    .await
+                    .map_err(|err| AppError::Internal(err.into()))??;
+                (
+                    image.bytes,
+                    image.content_type.to_string(),
+                    image.extension,
+                    Some(image.width),
+                    Some(image.height),
+                )
             }
-            MediaKind::MessageAudio => (audio_extension(&content_type), None, None),
+            MediaKind::MessageAudio => {
+                let extension = audio_extension(&content_type);
+                (bytes.to_vec(), content_type, extension, None, None)
+            }
         };
+        let size_bytes = bytes.len();
 
         let filename = format!("{file_stem}.{extension}");
         let dir = self.root.join(relative_dir);
@@ -192,15 +202,6 @@ impl LocalStorage {
     }
 }
 
-fn image_extension(format: ImageFormat) -> Option<&'static str> {
-    match format {
-        ImageFormat::Jpeg => Some("jpg"),
-        ImageFormat::Png => Some("png"),
-        ImageFormat::WebP => Some("webp"),
-        _ => None,
-    }
-}
-
 fn audio_extension(content_type: &str) -> &'static str {
     match content_type.to_ascii_lowercase().as_str() {
         "audio/aac" => "aac",
@@ -211,13 +212,66 @@ fn audio_extension(content_type: &str) -> &'static str {
     }
 }
 
-fn inspect_image(bytes: &[u8]) -> Option<(ImageFormat, (i32, i32))> {
-    let reader = ImageReader::new(Cursor::new(bytes))
+struct SanitizedImage {
+    bytes: Vec<u8>,
+    content_type: &'static str,
+    extension: &'static str,
+    width: i32,
+    height: i32,
+}
+
+const JPEG_QUALITY: u8 = 90;
+const MAX_IMAGE_SIDE: u32 = 8192;
+
+fn sanitize_image(bytes: &[u8]) -> AppResult<SanitizedImage> {
+    let invalid = || AppError::BadRequest("upload is not a valid image".into());
+    let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
-        .ok()?;
-    let format = reader.format()?;
-    let (width, height) = reader.into_dimensions().ok()?;
-    Some((format, (width as i32, height as i32)))
+        .map_err(|_| invalid())?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    reader.limits(limits);
+    let format = reader.format().ok_or_else(invalid)?;
+    let mut decoder = reader.into_decoder().map_err(|_| invalid())?;
+    let orientation = decoder.orientation().map_err(|_| invalid())?;
+    let mut image = DynamicImage::from_decoder(decoder).map_err(|_| invalid())?;
+    image.apply_orientation(orientation);
+
+    let mut encoded = Vec::new();
+    let (content_type, extension) = match format {
+        ImageFormat::Jpeg => {
+            JpegEncoder::new_with_quality(&mut encoded, JPEG_QUALITY)
+                .encode_image(&DynamicImage::ImageRgb8(image.to_rgb8()))
+                .map_err(|err| AppError::Internal(err.into()))?;
+            ("image/jpeg", "jpg")
+        }
+        ImageFormat::Png => {
+            image
+                .write_with_encoder(PngEncoder::new(&mut encoded))
+                .map_err(|err| AppError::Internal(err.into()))?;
+            ("image/png", "png")
+        }
+        ImageFormat::WebP => {
+            DynamicImage::ImageRgba8(image.to_rgba8())
+                .write_with_encoder(WebPEncoder::new_lossless(&mut encoded))
+                .map_err(|err| AppError::Internal(err.into()))?;
+            ("image/webp", "webp")
+        }
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported image format {other:?}"
+            )));
+        }
+    };
+
+    Ok(SanitizedImage {
+        bytes: encoded,
+        content_type,
+        extension,
+        width: image.width() as i32,
+        height: image.height() as i32,
+    })
 }
 
 pub fn profile_photo_dir(tenant_id: Uuid, member_id: Uuid) -> String {
@@ -260,6 +314,41 @@ mod tests {
             storage.resolve_relative("images/tenant/chat/file.jpg"),
             Some(PathBuf::from("/srv/media/images/tenant/chat/file.jpg"))
         );
+    }
+
+    fn jpeg_with_exif_orientation(width: u32, height: u32, orientation: u8) -> Vec<u8> {
+        let mut plain = Vec::new();
+        DynamicImage::new_rgb8(width, height)
+            .write_to(&mut Cursor::new(&mut plain), ImageFormat::Jpeg)
+            .expect("encode test jpeg");
+
+        let mut exif = b"Exif\0\0MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0".to_vec();
+        exif.extend_from_slice(&[orientation, 0, 0, 0, 0, 0, 0]);
+        let segment_length = (exif.len() + 2) as u16;
+
+        let mut tagged = plain[..2].to_vec();
+        tagged.extend_from_slice(&[0xFF, 0xE1]);
+        tagged.extend_from_slice(&segment_length.to_be_bytes());
+        tagged.extend_from_slice(&exif);
+        tagged.extend_from_slice(&plain[2..]);
+        tagged
+    }
+
+    #[test]
+    fn uploaded_photos_lose_their_exif_but_keep_their_orientation() {
+        let tagged = jpeg_with_exif_orientation(4, 2, 6);
+        assert!(tagged.windows(4).any(|window| window == b"Exif"));
+
+        let sanitized = sanitize_image(&tagged).expect("sanitize jpeg");
+
+        assert!(!sanitized.bytes.windows(4).any(|window| window == b"Exif"));
+        assert_eq!((sanitized.width, sanitized.height), (2, 4));
+        assert_eq!(sanitized.content_type, "image/jpeg");
+    }
+
+    #[test]
+    fn bytes_that_are_not_an_image_are_rejected() {
+        assert!(sanitize_image(b"definitely not an image").is_err());
     }
 
     #[test]

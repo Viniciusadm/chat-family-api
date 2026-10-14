@@ -4,9 +4,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::Value;
 
-use crate::{auth::AuthUser, error::AppResult, state::AppState, utils::json_rows};
+use crate::{auth::AuthUser, error::AppResult, realtime::RealtimeEvent, state::AppState};
 
 #[derive(Deserialize)]
 pub(super) struct RealtimeQuery {
@@ -18,10 +17,10 @@ pub(super) async fn list_realtime_events(
     State(state): State<AppState>,
     auth: AuthUser,
     Query(query): Query<RealtimeQuery>,
-) -> AppResult<Json<Value>> {
-    let rows = sqlx::query(
+) -> AppResult<Json<Vec<RealtimeEvent>>> {
+    let events = sqlx::query_as::<_, RealtimeEvent>(
         r#"
-        SELECT e.*
+        SELECT e.id, e.tenant_id, e.type, e.chat_id, e.entity_id, e.occurred_at, e.payload
         FROM realtime_events e
         WHERE e.tenant_id = ?
           AND (? IS NULL OR e.occurred_at > ?)
@@ -32,7 +31,7 @@ pub(super) async fn list_realtime_events(
                 WHERE cp.chat_id = e.chat_id AND cp.member_id = ?
             )
           )
-        ORDER BY e.occurred_at ASC
+        ORDER BY e.occurred_at ASC, e.id ASC
         LIMIT ?
         "#,
     )
@@ -43,5 +42,5 @@ pub(super) async fn list_realtime_events(
     .bind(query.limit.unwrap_or(500).clamp(1, 1000))
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(json_rows(rows)))
+    Ok(Json(events))
 }

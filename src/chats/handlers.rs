@@ -11,59 +11,60 @@ use uuid::Uuid;
 
 use crate::{
     auth::{AuthUser, assert_chat_participant, require_adult},
+    crypto_api::revoke_chat_key_access,
     error::{AppError, AppResult},
-    realtime::{emit, emit_tx},
+    realtime::{PendingEvents, emit, emit_tx},
     state::AppState,
-    utils::row_to_json,
 };
 
-use super::dto::{ChatRequest, ReadRequest};
+use super::dto::{CHAT_COLUMNS, ChatRequest, ChatResponse, ChatRow, ReadRequest};
 
 pub(super) async fn list_chats(
     State(state): State<AppState>,
     auth: AuthUser,
-) -> AppResult<Json<Value>> {
-    let rows = sqlx::query(
+) -> AppResult<Json<Vec<ChatResponse>>> {
+    let sql = format!(
         r#"
-        SELECT c.*
+        SELECT {CHAT_COLUMNS}
         FROM chats c
         JOIN chat_participants cp ON cp.chat_id = c.id
         WHERE c.tenant_id = ? AND cp.member_id = ?
         ORDER BY c.updated_at DESC
-        "#,
-    )
-    .bind(auth.tenant_id)
-    .bind(auth.member_id)
-    .fetch_all(&state.pool)
-    .await?;
+        "#
+    );
+    let rows = sqlx::query_as::<_, ChatRow>(&sql)
+        .bind(auth.tenant_id)
+        .bind(auth.member_id)
+        .fetch_all(&state.pool)
+        .await?;
 
-    let mut chat_ids = Vec::with_capacity(rows.len());
-    for row in &rows {
-        chat_ids.push(row.try_get::<Uuid, _>("id")?);
-    }
+    let chat_ids: Vec<Uuid> = rows.iter().map(|chat| chat.id).collect();
     // Two aggregate queries for the whole page instead of two per chat.
     let mut participants = load_participants(&state.pool, &chat_ids).await?;
     let mut read_state = load_read_state(&state.pool, &chat_ids).await?;
 
-    let mut chats = Vec::with_capacity(rows.len());
-    for row in rows {
-        let chat_id: Uuid = row.try_get("id")?;
-        chats.push(merge_chat(
-            row,
-            participants.remove(&chat_id).unwrap_or_default(),
-            read_state.remove(&chat_id).unwrap_or_default(),
-        ));
-    }
-    Ok(Json(Value::Array(chats)))
+    let chats = rows
+        .into_iter()
+        .map(|chat| {
+            let chat_id = chat.id;
+            merge_chat(
+                chat,
+                participants.remove(&chat_id).unwrap_or_default(),
+                read_state.remove(&chat_id).unwrap_or_default(),
+            )
+        })
+        .collect();
+    Ok(Json(chats))
 }
 
 pub(super) async fn get_chat(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(chat_id): Path<Uuid>,
-) -> AppResult<Json<Value>> {
+) -> AppResult<Json<ChatResponse>> {
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
-    let row = sqlx::query("SELECT * FROM chats WHERE id = ? AND tenant_id = ?")
+    let sql = format!("SELECT {CHAT_COLUMNS} FROM chats c WHERE c.id = ? AND c.tenant_id = ?");
+    let chat = sqlx::query_as::<_, ChatRow>(&sql)
         .bind(chat_id)
         .bind(auth.tenant_id)
         .fetch_one(&state.pool)
@@ -72,7 +73,7 @@ pub(super) async fn get_chat(
     let mut participants = load_participants(&state.pool, &ids).await?;
     let mut read_state = load_read_state(&state.pool, &ids).await?;
     Ok(Json(merge_chat(
-        row,
+        chat,
         participants.remove(&chat_id).unwrap_or_default(),
         read_state.remove(&chat_id).unwrap_or_default(),
     )))
@@ -137,32 +138,24 @@ async fn load_read_state(
 }
 
 fn merge_chat(
-    row: sqlx::mysql::MySqlRow,
-    participants: Vec<Uuid>,
+    chat: ChatRow,
+    participant_ids: Vec<Uuid>,
     read_state: Vec<ReadStateEntry>,
-) -> Value {
-    let mut value = match row_to_json(row) {
-        Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
-
-    value.insert(
-        "participant_ids".into(),
-        Value::Array(participants.into_iter().map(|id| json!(id)).collect()),
-    );
-
-    let mut read_up_to = serde_json::Map::new();
-    let mut unread_by = serde_json::Map::new();
+) -> ChatResponse {
+    let mut read_up_to = HashMap::new();
+    let mut unread_by = HashMap::new();
     for (member_id, read_at, unread_count) in read_state {
         if let Some(read_at) = read_at {
-            read_up_to.insert(member_id.to_string(), json!(read_at));
+            read_up_to.insert(member_id, read_at);
         }
-        unread_by.insert(member_id.to_string(), json!(unread_count));
+        unread_by.insert(member_id, unread_count);
     }
-    value.insert("read_up_to".into(), Value::Object(read_up_to));
-    value.insert("unread_by".into(), Value::Object(unread_by));
-
-    Value::Object(value)
+    ChatResponse {
+        chat,
+        participant_ids,
+        read_up_to,
+        unread_by,
+    }
 }
 
 /// Rejects unknown members, members of another tenant and deleted members in a single
@@ -243,6 +236,7 @@ pub(super) async fn create_chat(
     }
 
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     assert_participants_belong(&mut tx, auth.tenant_id, &participants).await?;
 
     // A direct chat already exists for every pair of members, so creating a second one
@@ -277,7 +271,7 @@ pub(super) async fn create_chat(
     }
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "chat.created",
         Some(chat_id),
@@ -286,6 +280,7 @@ pub(super) async fn create_chat(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "id": chat_id })))
 }
 
@@ -305,6 +300,7 @@ pub(super) async fn update_chat(
             .await?
             .ok_or(AppError::NotFound("chat not found".into()))?;
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     sqlx::query("UPDATE chats SET name = COALESCE(?, name), updated_at = now() WHERE id = ? AND tenant_id = ?")
         .bind(req.name)
         .bind(chat_id)
@@ -350,7 +346,7 @@ pub(super) async fn update_chat(
                 .bind(chat_id)
                 .bind(removed)
                 .execute(&mut *tx)
-                .await?;
+                .await?;            revoke_chat_key_access(&mut tx, Some(chat_id), *removed).await?;
         }
         for added in participants.iter().filter(|id| !current_ids.contains(id)) {
             sqlx::query("INSERT INTO chat_participants (chat_id, member_id) VALUES (?, ?)")
@@ -367,7 +363,7 @@ pub(super) async fn update_chat(
     }
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "chat.updated",
         Some(chat_id),
@@ -376,6 +372,7 @@ pub(super) async fn update_chat(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -387,6 +384,7 @@ pub(super) async fn delete_chat(
     require_adult(&auth)?;
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
     let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     sqlx::query("DELETE FROM chats WHERE id = ? AND tenant_id = ?")
         .bind(chat_id)
         .bind(auth.tenant_id)
@@ -394,7 +392,7 @@ pub(super) async fn delete_chat(
         .await?;
     emit_tx(
         &mut tx,
-        &state.hub,
+        &mut events,
         auth.tenant_id,
         "chat.deleted",
         None,
@@ -403,6 +401,7 @@ pub(super) async fn delete_chat(
     )
     .await?;
     tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "ok": true })))
 }
 

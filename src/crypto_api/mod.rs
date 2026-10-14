@@ -1,12 +1,15 @@
 use axum::{
     Router,
-    routing::{get, put},
+    routing::{get, post, put},
 };
 
 use crate::state::AppState;
 
 mod dto;
 mod handlers;
+
+pub(crate) use dto::KeyRecipientDevice;
+pub(crate) use handlers::revoke_chat_key_access;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -35,6 +38,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/chats/{chat_id}/key-recipients",
             get(handlers::list_chat_key_recipients),
+        )
+        .route(
+            "/chats/{chat_id}/key-claim",
+            post(handlers::claim_chat_key),
         )
         .route(
             "/chats/{chat_id}/devices/{device_id}/key-shares",
