@@ -1,0 +1,380 @@
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, header},
+};
+use jsonwebtoken::{DecodingKey, Validation, decode};
+use serde_json::{Value, json};
+use sqlx::Row;
+use uuid::Uuid;
+
+use crate::{
+    auth::{AuthUser, Claims, require_adult},
+    error::{AppError, AppResult},
+    realtime::emit_tx,
+    state::AppState,
+    utils::json_rows,
+};
+
+use super::dto::{DeviceRequest, KeyRecipientQuery};
+
+pub(crate) async fn activate_device(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    device_id: Uuid,
+    approved: bool,
+    push_token: Option<String>,
+    public_key: Option<String>,
+) -> AppResult<()> {
+    enforce_public_key_immutability(tx, device_id, public_key.as_deref()).await?;
+
+    let existing = sqlx::query("SELECT tenant_id, user_id, approved FROM devices WHERE id = ?")
+        .bind(device_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+    let mut effective_approved = approved;
+    if let Some(row) = &existing {
+        if row.try_get::<Uuid, _>("tenant_id")? != tenant_id {
+            return Err(AppError::Conflict(
+                "device is already registered to another tenant".into(),
+            ));
+        }
+        // Keep a previously granted approval only when the same user comes back;
+        // handing the hardware to another member must not inherit it.
+        if row.try_get::<Uuid, _>("user_id")? == user_id {
+            effective_approved = approved || row.try_get::<bool, _>("approved")?;
+        }
+    }
+
+    if approved {
+        sqlx::query(
+            "UPDATE devices SET active = false, deactivation_reason = 'new_active_device' WHERE user_id = ? AND id <> ?",
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    // A device row is keyed by the client-side installation id, so the same row is
+    // reused when another member of the tenant logs in on the same hardware.
+    sqlx::query(
+        r#"
+        INSERT INTO devices (id, tenant_id, user_id, approved, active, push_token, public_key, session_at, last_active_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, now(), now())
+        ON DUPLICATE KEY UPDATE
+            user_id = VALUES(user_id),
+            approved = VALUES(approved),
+            active = VALUES(active),
+            push_token = COALESCE(VALUES(push_token), push_token),
+            public_key = COALESCE(public_key, VALUES(public_key)),
+            session_at = now(),
+            last_active_at = now(),
+            deactivation_reason = NULL
+        "#,
+    )
+    .bind(device_id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(effective_approved)
+    .bind(effective_approved)
+    .bind(push_token)
+    .bind(public_key)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+pub(crate) async fn enforce_public_key_immutability(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    device_id: Uuid,
+    incoming: Option<&str>,
+) -> AppResult<()> {
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT public_key FROM devices WHERE id = ?")
+            .bind(device_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+    match existing {
+        Some(current) if current != incoming => Err(AppError::Conflict(
+            "device public_key is immutable once set".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+pub(super) async fn create_device(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<DeviceRequest>,
+) -> AppResult<Json<Value>> {
+    let mut tx = state.pool.begin().await?;
+    enforce_public_key_immutability(&mut tx, req.device_id, req.public_key.as_deref()).await?;
+    let result = sqlx::query(
+        r#"
+        UPDATE devices SET
+            push_token = COALESCE(?, push_token),
+            public_key = COALESCE(public_key, ?),
+            last_active_at = now()
+        WHERE id = ? AND user_id = ?
+        "#,
+    )
+    .bind(req.push_token.as_deref())
+    .bind(req.public_key.as_deref())
+    .bind(req.device_id)
+    .bind(auth.user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        sqlx::query(
+            r#"
+            INSERT INTO devices (id, tenant_id, user_id, approved, active, push_token, public_key)
+            VALUES (?, ?, ?, FALSE, FALSE, ?, ?)
+            "#,
+        )
+        .bind(req.device_id)
+        .bind(auth.tenant_id)
+        .bind(auth.user_id)
+        .bind(req.push_token)
+        .bind(req.public_key)
+        .execute(&mut *tx)
+        .await?;
+    }
+    emit_tx(
+        &mut tx,
+        &state.hub,
+        auth.tenant_id,
+        "device.updated",
+        None,
+        Some(req.device_id),
+        json!({"user_id": auth.user_id}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "id": req.device_id })))
+}
+
+pub(super) async fn update_device(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(device_id): Path<Uuid>,
+    Json(req): Json<DeviceRequest>,
+) -> AppResult<Json<Value>> {
+    if auth.device_id != Some(device_id) {
+        return Err(AppError::Forbidden);
+    }
+
+    let mut tx = state.pool.begin().await?;
+    enforce_public_key_immutability(&mut tx, device_id, req.public_key.as_deref()).await?;
+    sqlx::query(
+        r#"
+        UPDATE devices SET
+            push_token = COALESCE(?, push_token),
+            public_key = COALESCE(public_key, ?),
+            last_active_at = now(),
+            session_at = now()
+        WHERE id = ? AND user_id = ?
+        "#,
+    )
+    .bind(req.push_token)
+    .bind(req.public_key)
+    .bind(device_id)
+    .bind(auth.user_id)
+    .execute(&mut *tx)
+    .await?;
+    emit_tx(
+        &mut tx,
+        &state.hub,
+        auth.tenant_id,
+        "device.updated",
+        None,
+        Some(device_id),
+        json!({}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub(super) async fn heartbeat_device(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(device_id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    if auth.device_id != Some(device_id) {
+        return Err(AppError::Forbidden);
+    }
+    sqlx::query("UPDATE devices SET last_active_at = now(), session_at = now() WHERE id = ? AND user_id = ?")
+        .bind(device_id)
+        .bind(auth.user_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub(super) async fn device_status(
+    State(state): State<AppState>,
+    Path(device_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> AppResult<Json<Value>> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(AppError::Unauthorized)?;
+    let claims = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(state.config.jwt_secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map_err(|_| AppError::Unauthorized)?
+    .claims;
+    if claims.device_id != Some(device_id) {
+        return Err(AppError::Forbidden);
+    }
+
+    let row = sqlx::query(
+        "SELECT approved, active, deactivation_reason FROM devices WHERE id = ? AND user_id = ?",
+    )
+    .bind(device_id)
+    .bind(claims.user_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound("device not found".into()))?;
+
+    Ok(Json(json!({
+        "device_id": device_id,
+        "approved": row.try_get::<bool, _>("approved")?,
+        "active": row.try_get::<bool, _>("active")?,
+        "reason": row.try_get::<Option<String>, _>("deactivation_reason")?,
+    })))
+}
+
+pub(super) async fn pending_devices(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> AppResult<Json<Value>> {
+    require_adult(&auth)?;
+    let rows = sqlx::query(
+        r#"
+        SELECT d.id, d.user_id, d.created_at, d.public_key, u.name, u.member_id
+        FROM devices d
+        JOIN users u ON u.id = d.user_id
+        WHERE d.tenant_id = ? AND d.approved = false
+        ORDER BY d.created_at DESC
+        "#,
+    )
+    .bind(auth.tenant_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(json_rows(rows)))
+}
+
+pub(super) async fn key_recipient_devices(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(query): Query<KeyRecipientQuery>,
+) -> AppResult<Json<Value>> {
+    require_adult(&auth)?;
+    let member_ids = query
+        .member_ids
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|value| Uuid::parse_str(value.trim()).ok())
+        .collect::<std::collections::HashSet<_>>();
+    if member_ids.is_empty() {
+        return Ok(Json(Value::Array(Vec::new())));
+    }
+
+    let placeholders = vec!["?"; member_ids.len()].join(",");
+    let sql = format!(
+        r#"
+        SELECT d.id, d.user_id, d.public_key, d.approved, d.active, d.created_at, u.member_id
+        FROM devices d
+        JOIN users u ON u.id = d.user_id AND u.deleted_at IS NULL
+        WHERE d.tenant_id = ?
+          AND d.approved = true
+          AND d.public_key IS NOT NULL
+          AND u.member_id IN ({placeholders})
+        ORDER BY d.created_at DESC
+        "#
+    );
+    let mut request = sqlx::query(&sql).bind(auth.tenant_id);
+    for member_id in &member_ids {
+        request = request.bind(member_id);
+    }
+    let rows = request.fetch_all(&state.pool).await?;
+
+    Ok(Json(json_rows(rows)))
+}
+
+pub(super) async fn approve_device(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(device_id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    require_adult(&auth)?;
+    let row = sqlx::query("SELECT user_id FROM devices WHERE id = ? AND tenant_id = ?")
+        .bind(device_id)
+        .bind(auth.tenant_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound("device not found".into()))?;
+    let user_id: Uuid = row.try_get("user_id")?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("UPDATE devices SET active = false, deactivation_reason = 'new_active_device' WHERE user_id = ? AND id <> ?")
+        .bind(user_id)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE devices SET approved = true, active = true, deactivation_reason = NULL, session_at = now() WHERE id = ?")
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+    emit_tx(
+        &mut tx,
+        &state.hub,
+        auth.tenant_id,
+        "device.updated",
+        None,
+        Some(device_id),
+        json!({"approved": true, "active": true}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub(super) async fn delete_device(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(device_id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    require_adult(&auth)?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("UPDATE devices SET active = false, deactivation_reason = 'admin_removed' WHERE id = ? AND tenant_id = ?")
+        .bind(device_id)
+        .bind(auth.tenant_id)
+        .execute(&mut *tx)
+        .await?;
+    emit_tx(
+        &mut tx,
+        &state.hub,
+        auth.tenant_id,
+        "device.updated",
+        None,
+        Some(device_id),
+        json!({"active": false, "reason": "admin_removed"}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "ok": true })))
+}
