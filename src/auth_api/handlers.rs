@@ -19,7 +19,8 @@ use crate::{
 };
 
 use super::dto::{
-    ChildLoginRequest, LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, UserResponse,
+    AcceptInviteRequest, ChildLoginRequest, LoginRequest, RefreshRequest, RegisterRequest,
+    TokenResponse, UserResponse,
 };
 use super::tokens::issue_tokens;
 
@@ -274,6 +275,120 @@ pub(super) async fn login(
         },
         row.try_get("email")?,
         row.try_get("name")?,
+    )
+    .await
+}
+
+pub(super) async fn accept_invite(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<AcceptInviteRequest>,
+) -> AppResult<Json<TokenResponse>> {
+    let email = req.email.trim().to_lowercase();
+    if email.is_empty() || req.password.len() < 8 {
+        return Err(AppError::BadRequest(
+            "email and password >= 8 are required".into(),
+        ));
+    }
+    let code = req.code.trim().to_string();
+    enforce_login_rate_limit(&state, &peer, &headers, &["device", &req.device_id.to_string()]).await?;
+
+    let password_hash = hash_password(req.password.clone()).await?;
+    let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
+    let row = sqlx::query(
+        r#"
+        SELECT lc.member_id, lc.tenant_id, m.name
+        FROM login_codes lc
+        JOIN members m ON m.id = lc.member_id
+        WHERE lc.code = ? AND lc.revoked_at IS NULL AND m.role = 'adult' AND m.deleted_at IS NULL
+        FOR UPDATE
+        "#,
+    )
+    .bind(&code)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::Unauthorized)?;
+    let tenant_id: Uuid = row.try_get("tenant_id")?;
+    let member_id: Uuid = row.try_get("member_id")?;
+    let name: String = row.try_get("name")?;
+
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO users (id, member_id, tenant_id, email, password_hash, name, role)
+        VALUES (?, ?, ?, ?, ?, ?, 'adult')
+        "#,
+    )
+    .bind(user_id)
+    .bind(member_id)
+    .bind(tenant_id)
+    .bind(&email)
+    .bind(password_hash)
+    .bind(&name)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| match error {
+        error if is_unique_violation(&error) => {
+            AppError::Conflict("email already registered".into())
+        }
+        other => AppError::Database(other),
+    })?;
+
+    sqlx::query("UPDATE login_codes SET revoked_at = now() WHERE member_id = ? AND revoked_at IS NULL")
+        .bind(member_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE members SET login_code = NULL WHERE id = ?")
+        .bind(member_id)
+        .execute(&mut *tx)
+        .await?;
+
+    activate_device(
+        &mut tx,
+        tenant_id,
+        user_id,
+        req.device_id,
+        true,
+        req.push_token,
+        req.public_key,
+    )
+    .await?;
+    emit_tx(
+        &mut tx,
+        &mut events,
+        tenant_id,
+        "member.updated",
+        None,
+        Some(member_id),
+        json!({"invite_accepted": true}),
+    )
+    .await?;
+    emit_tx(
+        &mut tx,
+        &mut events,
+        tenant_id,
+        "device.updated",
+        None,
+        Some(req.device_id),
+        json!({"user_id": user_id, "active": true}),
+    )
+    .await?;
+    tx.commit().await?;
+    events.publish(&state.hub);
+
+    issue_tokens(
+        &state,
+        AuthUser {
+            user_id,
+            member_id,
+            tenant_id,
+            device_id: Some(req.device_id),
+            role: Role::Adult,
+        },
+        Some(email),
+        name,
     )
     .await
 }
