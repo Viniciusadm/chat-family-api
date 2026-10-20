@@ -978,6 +978,147 @@ async fn a_child_login_code_creates_a_pending_device() {
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL_TEST"]
+async fn an_invited_adult_sets_credentials_with_the_invite_code() {
+    let server = server!();
+    let family = seed_family(&server).await;
+
+    let (status, created) = server
+        .post(
+            "/members",
+            &family.adult.token,
+            json!({ "name": "Rui", "role": "adult" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let member_id = created["id"].as_str().expect("member id").to_string();
+    let code = created["login_code"].as_str().expect("invite code").to_string();
+
+    let (status, _) = server
+        .call(
+            "POST",
+            "/auth/child-login",
+            None,
+            Some(json!({ "code": code, "device_id": Uuid::new_v4() })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "an adult invite is not a child login");
+
+    let email = unique_email();
+    let device_id = Uuid::new_v4();
+    let (status, accepted) = server
+        .call(
+            "POST",
+            "/auth/accept-invite",
+            None,
+            Some(json!({
+                "code": code,
+                "email": email,
+                "password": "correct horse battery",
+                "device_id": device_id,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(accepted["user"]["role"], json!("adult"));
+    assert_eq!(accepted["user"]["member_id"], json!(member_id));
+    assert_eq!(accepted["user"]["tenant_id"], json!(family.tenant_id));
+
+    let (status, _) = server
+        .call(
+            "POST",
+            "/auth/accept-invite",
+            None,
+            Some(json!({
+                "code": code,
+                "email": unique_email(),
+                "password": "correct horse battery",
+                "device_id": Uuid::new_v4(),
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "an invite works only once");
+
+    let (status, logged_in) = server
+        .call(
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({
+                "email": email,
+                "password": "correct horse battery",
+                "device_id": device_id,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(logged_in["user"]["member_id"], json!(member_id));
+
+    let (_, members) = server.get("/members", &family.adult.token).await;
+    let invited = members
+        .as_array()
+        .expect("members")
+        .iter()
+        .find(|member| member["id"] == json!(member_id))
+        .expect("the invited adult is listed");
+    assert!(invited["login_code"].is_null(), "the used invite is no longer shown");
+
+    family.cleanup(&server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TEST"]
+async fn deleting_a_member_drops_their_direct_chats_without_messages() {
+    let server = server!();
+    let family = seed_family(&server).await;
+    let leaving = seed_member(&server, family.tenant_id, chat_back::auth::Role::Child).await;
+
+    let mut chat_ids = Vec::new();
+    for other in [family.adult.member_id, family.child.member_id] {
+        let chat_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO chats (id, tenant_id, is_group, name) VALUES (?, ?, false, '')")
+            .bind(chat_id)
+            .bind(family.tenant_id)
+            .execute(&server.state.pool)
+            .await
+            .expect("insert chat");
+        for member_id in [leaving.member_id, other] {
+            sqlx::query("INSERT INTO chat_participants (chat_id, member_id) VALUES (?, ?)")
+                .bind(chat_id)
+                .bind(member_id)
+                .execute(&server.state.pool)
+                .await
+                .expect("insert chat participant");
+        }
+        chat_ids.push(chat_id);
+    }
+    let (chat_with_messages, empty_chat) = (chat_ids[0], chat_ids[1]);
+    let (status, _) = server
+        .post(
+            &format!("/chats/{chat_with_messages}/messages"),
+            &family.adult.token,
+            text_message(Uuid::new_v4()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = server
+        .delete(&format!("/members/{}", leaving.member_id), &family.adult.token)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let remaining: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM chats WHERE id IN (?, ?)")
+        .bind(chat_with_messages)
+        .bind(empty_chat)
+        .fetch_all(&server.state.pool)
+        .await
+        .expect("list chats");
+    assert_eq!(remaining, vec![chat_with_messages]);
+
+    family.cleanup(&server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TEST"]
 async fn a_member_of_another_tenant_cannot_reach_a_chat() {
     let server = server!();
     let family = seed_family(&server).await;

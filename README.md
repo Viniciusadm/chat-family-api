@@ -26,7 +26,7 @@ Only one device creates a chat key. Before generating one, a device calls `POST 
 
 A `tenant` is the closed group. Every row carries `tenant_id` and every query filters by it.
 
-Members are `adult` or `child`. Adults sign in with a password (`POST /auth/login`, Argon2 hash); children sign in with a code from `login_codes` (`POST /auth/child-login`).
+Members are `adult` or `child`. Adults sign in with a password (`POST /auth/login`, Argon2 hash); children sign in with a code from `login_codes` (`POST /auth/child-login`). An adult created by another adult also gets a code, used once as an invite: `POST /auth/accept-invite` sets that member's e-mail and password and revokes the code.
 
 Devices start unapproved. An adult lists them at `GET /admin/devices/pending` and approves one with `POST /admin/devices/{id}/approve`. Approving a device deactivates the user's other devices and records why in `deactivation_reason` (`new_active_device`, `logout`, `admin_removed`, `account_deleted`).
 
@@ -84,7 +84,7 @@ It listens on `127.0.0.1:3000`. Set `BIND_ADDR=0.0.0.0:3000` to reach it from a 
 
 | Area | Routes |
 | --- | --- |
-| Session | `POST /auth/register` `/auth/login` `/auth/child-login` `/auth/refresh` `/auth/logout`, `GET /auth/me` |
+| Session | `POST /auth/register` `/auth/login` `/auth/child-login` `/auth/accept-invite` `/auth/refresh` `/auth/logout`, `GET /auth/me` |
 | Devices | `POST /devices`, `GET PATCH /devices/{id}`, `POST /devices/{id}/heartbeat` |
 | Admin | `GET /admin/devices/pending` `/admin/devices/key-recipients`, `POST /admin/devices/{id}/approve`, `DELETE /admin/devices/{id}` |
 | Members | `GET POST /members`, `PATCH DELETE /members/{id}`, `DELETE /members/{id}/photo` |

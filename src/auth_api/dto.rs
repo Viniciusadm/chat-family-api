@@ -49,6 +49,16 @@ pub(super) struct ChildLoginRequest {
 }
 
 #[derive(Deserialize)]
+pub(super) struct AcceptInviteRequest {
+    pub code: String,
+    pub email: String,
+    pub password: String,
+    pub device_id: Uuid,
+    pub push_token: Option<String>,
+    pub public_key: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub(super) struct RefreshRequest {
     pub refresh_token: String,
 }

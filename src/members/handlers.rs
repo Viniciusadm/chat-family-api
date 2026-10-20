@@ -42,11 +42,7 @@ pub(super) async fn create_member(
         return Err(AppError::BadRequest("name is required".into()));
     }
     let role = req.role.unwrap_or(Role::Child);
-    let login_code = if role == Role::Child {
-        Some(generate_login_code())
-    } else {
-        None
-    };
+    let login_code = generate_login_code();
 
     let mut tx = state.pool.begin().await?;
     let mut events = PendingEvents::default();
@@ -62,18 +58,16 @@ pub(super) async fn create_member(
     .execute(&mut *tx)
     .await?;
 
-    if let Some(code) = &login_code {
-        sqlx::query(
-            "INSERT INTO login_codes (code, member_id, tenant_id, name_snapshot, role_snapshot) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(code)
-        .bind(member_id)
-        .bind(auth.tenant_id)
-        .bind(name)
-        .bind(role.as_db())
-        .execute(&mut *tx)
-        .await?;
-    }
+    sqlx::query(
+        "INSERT INTO login_codes (code, member_id, tenant_id, name_snapshot, role_snapshot) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&login_code)
+    .bind(member_id)
+    .bind(auth.tenant_id)
+    .bind(name)
+    .bind(role.as_db())
+    .execute(&mut *tx)
+    .await?;
 
     let new_chat_ids = create_direct_chats_for_member(&mut tx, auth.tenant_id, member_id).await?;
     emit_tx(
@@ -233,6 +227,38 @@ pub(super) async fn delete_member(
         .execute(&mut *tx)
         .await?;
     revoke_chat_key_access(&mut tx, None, member_id).await?;
+    let empty_direct_chat_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT c.id
+        FROM chats c
+        JOIN chat_participants cp ON cp.chat_id = c.id
+        WHERE c.tenant_id = ? AND c.is_group = FALSE AND cp.member_id = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM messages m WHERE m.chat_id = c.id
+          )
+        "#,
+    )
+    .bind(auth.tenant_id)
+    .bind(member_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for chat_id in &empty_direct_chat_ids {
+        sqlx::query("DELETE FROM chats WHERE id = ? AND tenant_id = ?")
+            .bind(chat_id)
+            .bind(auth.tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        emit_tx(
+            &mut tx,
+            &mut events,
+            auth.tenant_id,
+            "chat.deleted",
+            None,
+            Some(*chat_id),
+            json!({"chat_id": chat_id}),
+        )
+        .await?;
+    }
     emit_tx(
         &mut tx,
         &mut events,

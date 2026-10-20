@@ -14,6 +14,7 @@ pub fn routes() -> Router<AppState> {
         .route("/auth/register", post(handlers::register))
         .route("/auth/login", post(handlers::login))
         .route("/auth/child-login", post(handlers::child_login))
+        .route("/auth/accept-invite", post(handlers::accept_invite))
         .route("/auth/refresh", post(handlers::refresh))
         .route("/auth/logout", post(handlers::logout))
         .route("/auth/me", get(handlers::me))
