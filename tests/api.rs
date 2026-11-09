@@ -70,6 +70,113 @@ macro_rules! server {
     };
 }
 
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TEST"]
+async fn changed_cursor_pages_messages_that_share_the_same_timestamp() {
+    let server = server!();
+    let family = seed_family(&server).await;
+    let time = chrono::Utc::now();
+    let ids: Vec<Uuid> = (0..125).map(|_| Uuid::new_v4()).collect();
+    let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO messages (id, chat_id, tenant_id, sender_member_id, type, ciphertext, iv, enc_version, created_at, updated_at) ",
+    );
+    insert.push_values(&ids, |mut row, id| {
+        row.push_bind(*id)
+            .push_bind(family.direct_chat_id)
+            .push_bind(family.tenant_id)
+            .push_bind(family.adult.member_id)
+            .push_bind("text")
+            .push_bind("ciphertext")
+            .push_bind("iv")
+            .push_bind(1)
+            .push_bind(time)
+            .push_bind(time);
+    });
+    insert
+        .build()
+        .execute(&server.state.pool)
+        .await
+        .expect("insert timestamp ties");
+    let before = encode_cursor(&(time - chrono::Duration::seconds(1)).to_rfc3339());
+    let path = format!("/chats/{}/messages", family.direct_chat_id);
+    let (status, first) = server
+        .get(
+            &format!("{path}?changed_after={before}&limit=100"),
+            &family.adult.token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let first = first.as_array().unwrap();
+    assert_eq!(first.len(), 100);
+    let boundary = first.last().unwrap();
+    let cursor = encode_cursor(boundary["updated_at"].as_str().unwrap());
+    let last_id = boundary["id"].as_str().unwrap();
+    let (status, second) = server
+        .get(
+            &format!("{path}?changed_after={cursor}&changed_after_id={last_id}&limit=100"),
+            &family.adult.token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let second = second.as_array().unwrap();
+    assert_eq!(second.len(), 25);
+    let collected: std::collections::HashSet<_> = first
+        .iter()
+        .chain(second)
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(collected.len(), ids.len());
+    let (_, legacy) = server
+        .get(
+            &format!("{path}?changed_after={cursor}"),
+            &family.adult.token,
+        )
+        .await;
+    assert!(
+        legacy.as_array().unwrap().is_empty(),
+        "the timestamp-only cursor remains strict"
+    );
+    family.cleanup(&server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TEST"]
+async fn uploaded_audio_keeps_its_bytes_when_downloaded() {
+    let server = server!();
+    let family = seed_family(&server).await;
+    let message_id = Uuid::new_v4();
+    let base = format!("/chats/{}/messages", family.direct_chat_id);
+    let (status, _) = server
+        .post(
+            &base,
+            &family.adult.token,
+            json!({"id": message_id, "type": "audio"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let original = vec![0x42; 512 * 1024];
+    let (status, uploaded) = server
+        .upload(
+            &format!("{base}/{message_id}/audio"),
+            &family.adult.token,
+            "test.m4a",
+            "audio/mp4",
+            &original,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let path = format!(
+        "/static/{}",
+        uploaded["path"].as_str().expect("uploaded path")
+    );
+    let (status, downloaded) = server
+        .call_raw("GET", &path, Some(&family.child.token), None, Vec::new())
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(downloaded, original);
+    family.cleanup(&server).await;
+}
+
 async fn message_field(
     server: &TestServer,
     family: &Family,

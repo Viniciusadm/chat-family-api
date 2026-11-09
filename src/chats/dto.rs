@@ -22,6 +22,7 @@ pub(super) struct MessageQuery {
     pub after: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
     pub changed_after: Option<DateTime<Utc>>,
+    pub changed_after_id: Option<Uuid>,
     pub limit: Option<i64>,
 }
 

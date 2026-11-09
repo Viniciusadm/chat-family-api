@@ -35,8 +35,9 @@ pub(super) async fn list_messages(
                 r#"
                 SELECT {MESSAGE_COLUMNS}
                 FROM messages
-                WHERE chat_id = ? AND tenant_id = ? AND updated_at > ?
-                ORDER BY updated_at ASC
+                WHERE chat_id = ? AND tenant_id = ?
+                  AND (updated_at > ? OR (updated_at = ? AND id > ?))
+                ORDER BY updated_at ASC, id ASC
                 LIMIT ?
                 "#
             );
@@ -44,6 +45,8 @@ pub(super) async fn list_messages(
                 .bind(chat_id)
                 .bind(auth.tenant_id)
                 .bind(changed_after)
+                .bind(changed_after)
+                .bind(query.changed_after_id)
                 .bind(limit)
                 .fetch_all(&state.pool)
                 .await?

@@ -133,3 +133,15 @@ DATABASE_URL_TEST=mysql://user:pass@localhost:3306/chat_back_test cargo test -- 
 ```
 
 The unit tests cover message payload validation, media path resolution and the rate limit buckets. The API tests run against a real MySQL and cover registration, login and `/auth/me`, refresh token rotation and logout, child login with a pending device, tenant isolation, media download authorization, realtime event filtering, the message history cursor, child permissions on chats, read state, member deletion and direct chat deduplication. `--include-ignored` runs the unit tests and the API tests together.
+
+## Performance checks
+
+After applying migrations to the test database, compare the chat-preview query on synthetic history:
+
+```bash
+DATABASE_URL_TEST=mysql://user:pass@localhost:3306/chat_back_test python3 scripts/benchmark_preview.py --rows 10000
+```
+
+This requires the `mysql` client. It inserts fixtures in a transaction and rolls them back, then reports MySQL's execution plans and median query time. The baseline forces the previous index; the optimized plan uses the optimizer's normal index selection. These timings measure SQL execution on this dataset, not end-to-end request or phone performance.
+
+Incremental message sync accepts `changed_after` plus optional `changed_after_id`. Keep both values from the last row of each page; the ID breaks ties when several messages share the same update timestamp. Timestamp-only clients keep their existing strict `updated_at > changed_after` behavior.

@@ -129,7 +129,7 @@ impl LocalStorage {
                     .await
                     .map_err(|err| AppError::Internal(err.into()))??;
                 (
-                    image.bytes,
+                    image.bytes.into(),
                     image.content_type.to_string(),
                     image.extension,
                     Some(image.width),
@@ -138,7 +138,7 @@ impl LocalStorage {
             }
             MediaKind::MessageAudio => {
                 let extension = audio_extension(&content_type);
-                (bytes.to_vec(), content_type, extension, None, None)
+                (bytes, content_type, extension, None, None)
             }
         };
         let size_bytes = bytes.len();

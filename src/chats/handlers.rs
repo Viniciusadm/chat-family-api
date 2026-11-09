@@ -40,8 +40,10 @@ pub(super) async fn list_chats(
 
     let chat_ids: Vec<Uuid> = rows.iter().map(|chat| chat.id).collect();
     // Two aggregate queries for the whole page instead of two per chat.
-    let mut participants = load_participants(&state.pool, &chat_ids).await?;
-    let mut read_state = load_read_state(&state.pool, &chat_ids).await?;
+    let (mut participants, mut read_state) = tokio::try_join!(
+        load_participants(&state.pool, &chat_ids),
+        load_read_state(&state.pool, &chat_ids),
+    )?;
 
     let chats = rows
         .into_iter()
@@ -70,8 +72,10 @@ pub(super) async fn get_chat(
         .fetch_one(&state.pool)
         .await?;
     let ids = [chat_id];
-    let mut participants = load_participants(&state.pool, &ids).await?;
-    let mut read_state = load_read_state(&state.pool, &ids).await?;
+    let (mut participants, mut read_state) = tokio::try_join!(
+        load_participants(&state.pool, &ids),
+        load_read_state(&state.pool, &ids),
+    )?;
     Ok(Json(merge_chat(
         chat,
         participants.remove(&chat_id).unwrap_or_default(),
