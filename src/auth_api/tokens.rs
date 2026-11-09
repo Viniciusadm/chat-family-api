@@ -1,5 +1,6 @@
 use axum::Json;
 use chrono::{Duration, Utc};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
@@ -36,6 +37,13 @@ pub(super) async fn issue_tokens(
         error
     })?;
 
+    let photo =
+        sqlx::query("SELECT photo_url, photo_path FROM members WHERE id = ? AND tenant_id = ?")
+            .bind(auth.member_id)
+            .bind(auth.tenant_id)
+            .fetch_one(&state.pool)
+            .await?;
+
     Ok(Json(TokenResponse {
         access_token,
         refresh_token,
@@ -47,6 +55,8 @@ pub(super) async fn issue_tokens(
             role: auth.role,
             email,
             device_id: auth.device_id,
+            photo_url: photo.try_get("photo_url")?,
+            photo_path: photo.try_get("photo_path")?,
         },
     }))
 }

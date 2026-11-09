@@ -614,7 +614,7 @@ pub(super) async fn me(
     auth: AuthUser,
 ) -> AppResult<Json<UserResponse>> {
     let row = sqlx::query(
-        "SELECT id, member_id, tenant_id, name, email, role AS role FROM users WHERE id = ?",
+        "SELECT u.id, u.member_id, u.tenant_id, u.name, u.email, u.role, m.photo_url, m.photo_path FROM users u JOIN members m ON m.id = u.member_id WHERE u.id = ?",
     )
     .bind(auth.user_id)
     .fetch_one(&state.pool)
@@ -629,6 +629,8 @@ pub(super) async fn me(
         role: Role::try_from(role.as_str())?,
         email: row.try_get("email")?,
         device_id: auth.device_id,
+        photo_url: row.try_get("photo_url")?,
+        photo_path: row.try_get("photo_path")?,
     }))
 }
 

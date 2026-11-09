@@ -1,5 +1,60 @@
 mod common;
 
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TEST"]
+async fn editing_and_deleting_messages_reconciles_the_chat_preview() {
+    let Some(server) = common::start().await else {
+        return;
+    };
+    let family = seed_family(&server).await;
+    let chat_path = format!("/chats/{}", family.direct_chat_id);
+    let older = Uuid::new_v4();
+    let newer = Uuid::new_v4();
+    for id in [older, newer] {
+        let (status, _) = server
+            .post(
+                &format!("{chat_path}/messages"),
+                &family.adult.token,
+                text_message(id),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _) = server.patch(
+        &format!("{chat_path}/messages/{newer}"), &family.adult.token,
+        json!({"id": newer, "type": "text", "ciphertext": "ZWRpdGVk", "iv": "aXY=", "enc_version": 1}),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, chat) = server.get(&chat_path, &family.adult.token).await;
+    assert_eq!(chat["last_message_ciphertext"], json!("ZWRpdGVk"));
+
+    let (status, _) = server
+        .delete(
+            &format!("{chat_path}/messages/{newer}"),
+            &family.adult.token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, chat) = server.get(&chat_path, &family.adult.token).await;
+    assert_eq!(
+        chat["last_message_ciphertext"],
+        text_message(older)["ciphertext"]
+    );
+
+    let (status, _) = server
+        .delete(
+            &format!("{chat_path}/messages/{older}"),
+            &family.adult.token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, chat) = server.get(&chat_path, &family.adult.token).await;
+    assert!(chat["last_message_ciphertext"].is_null());
+    assert!(chat["last_message_type"].is_null());
+    assert!(chat["last_message_at"].is_null());
+    family.cleanup(&server).await;
+}
+
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -218,6 +273,41 @@ async fn marking_a_chat_read_creates_the_missing_read_state_row() {
     assert!(
         chat["read_up_to"][family.child.member_id.to_string()].is_string(),
         "the read receipt has to reach the chat payload"
+    );
+
+    let (_, events) = server.get("/realtime/events", &family.adult.token).await;
+    let receipt = events
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["type"] == "chat.read")
+        .expect("reading publishes a receipt for the other participant");
+    assert_eq!(
+        receipt["payload"]["member_id"],
+        json!(family.child.member_id)
+    );
+    assert_eq!(
+        receipt["payload"]["read_up_to"],
+        chat["read_up_to"][family.child.member_id.to_string()]
+    );
+
+    let (status, _) = server
+        .post(
+            &format!("/chats/{}/read", family.direct_chat_id),
+            &family.child.token,
+            json!({"read_up_to": "2020-01-01T00:00:00Z"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, after) = server
+        .get(
+            &format!("/chats/{}", family.direct_chat_id),
+            &family.child.token,
+        )
+        .await;
+    assert_eq!(
+        after["read_up_to"], chat["read_up_to"],
+        "delayed requests cannot move receipts backwards"
     );
 
     family.cleanup(&server).await;
@@ -837,6 +927,13 @@ async fn a_registered_adult_can_log_in_and_read_its_profile() {
     let password = "correct horse battery";
     let registered = register(&server, &email, password).await;
     let tenant_id = tenant_of(&registered);
+    sqlx::query("UPDATE members SET photo_url = ?, photo_path = ? WHERE tenant_id = ?")
+        .bind("http://localhost:3000/static/profile.jpg")
+        .bind("profile.jpg")
+        .bind(tenant_id)
+        .execute(&server.state.pool)
+        .await
+        .expect("set a profile photo");
 
     let device_id = Uuid::new_v4();
     let (status, _) = server
@@ -869,6 +966,13 @@ async fn a_registered_adult_can_log_in_and_read_its_profile() {
     assert_eq!(me["name"], json!("Ana"));
     assert_eq!(me["email"], json!(email));
     assert_eq!(me["device_id"], json!(device_id));
+    assert_eq!(
+        me["photo_url"],
+        json!("http://localhost:3000/static/profile.jpg")
+    );
+    assert_eq!(me["photo_path"], json!("profile.jpg"));
+    assert_eq!(logged_in["user"]["photo_url"], me["photo_url"]);
+    assert_eq!(logged_in["user"]["photo_path"], me["photo_path"]);
 
     common::delete_tenant(&server, tenant_id).await;
 }

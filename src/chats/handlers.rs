@@ -447,19 +447,40 @@ pub(super) async fn mark_chat_read(
     Json(req): Json<ReadRequest>,
 ) -> AppResult<Json<Value>> {
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
-    // A plain UPDATE silently dropped the read receipt whenever the row was missing, which
-    // is the case for any participant added before chat_read_state was seeded.
+    let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     sqlx::query(
         r#"
         INSERT INTO chat_read_state (chat_id, member_id, read_up_to, unread_count)
         VALUES (?, ?, COALESCE(?, now()), 0)
-        ON DUPLICATE KEY UPDATE read_up_to = VALUES(read_up_to), unread_count = 0
+        ON DUPLICATE KEY UPDATE
+          read_up_to = GREATEST(COALESCE(read_up_to, VALUES(read_up_to)), VALUES(read_up_to)),
+          unread_count = 0
         "#,
     )
     .bind(chat_id)
     .bind(auth.member_id)
     .bind(req.read_up_to)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
+    let read_up_to: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT read_up_to FROM chat_read_state WHERE chat_id = ? AND member_id = ?",
+    )
+    .bind(chat_id)
+    .bind(auth.member_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    emit_tx(
+        &mut tx,
+        &mut events,
+        auth.tenant_id,
+        "chat.read",
+        Some(chat_id),
+        Some(auth.member_id),
+        json!({"member_id": auth.member_id, "read_up_to": read_up_to}),
+    )
+    .await?;
+    tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "ok": true })))
 }

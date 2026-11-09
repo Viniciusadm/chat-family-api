@@ -5,12 +5,13 @@ use axum::{
     extract::{Path, Query, State},
 };
 use serde_json::{Value, json};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
     auth::{AuthUser, assert_chat_participant},
     error::{AppError, AppResult},
-    realtime::{PendingEvents, emit, emit_tx},
+    realtime::{PendingEvents, emit_tx},
     state::AppState,
     utils::is_unique_violation,
 };
@@ -230,6 +231,8 @@ pub(super) async fn update_message(
 ) -> AppResult<Json<Value>> {
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
     validate_message_payload(&req)?;
+    let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     let affected = sqlx::query(
         r#"
         UPDATE messages
@@ -245,15 +248,16 @@ pub(super) async fn update_message(
     .bind(chat_id)
     .bind(auth.tenant_id)
     .bind(auth.member_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected == 0 {
         return Err(AppError::Forbidden);
     }
-    emit(
-        &state.pool,
-        &state.hub,
+    refresh_chat_preview(&mut tx, chat_id, auth.tenant_id).await?;
+    emit_tx(
+        &mut tx,
+        &mut events,
         auth.tenant_id,
         "message.updated",
         Some(chat_id),
@@ -261,6 +265,8 @@ pub(super) async fn update_message(
         json!({}),
     )
     .await?;
+    tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -270,6 +276,8 @@ pub(super) async fn delete_message(
     Path((chat_id, message_id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<Value>> {
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
+    let mut tx = state.pool.begin().await?;
+    let mut events = PendingEvents::default();
     let affected = sqlx::query(
         r#"
         UPDATE messages
@@ -282,15 +290,16 @@ pub(super) async fn delete_message(
     .bind(chat_id)
     .bind(auth.tenant_id)
     .bind(auth.member_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected == 0 {
         return Err(AppError::Forbidden);
     }
-    emit(
-        &state.pool,
-        &state.hub,
+    refresh_chat_preview(&mut tx, chat_id, auth.tenant_id).await?;
+    emit_tx(
+        &mut tx,
+        &mut events,
         auth.tenant_id,
         "message.deleted",
         Some(chat_id),
@@ -298,7 +307,44 @@ pub(super) async fn delete_message(
         json!({}),
     )
     .await?;
+    tx.commit().await?;
+    events.publish(&state.hub);
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn refresh_chat_preview(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    chat_id: Uuid,
+    tenant_id: Uuid,
+) -> AppResult<()> {
+    let last = sqlx::query(
+        "SELECT ciphertext, iv, type, created_at FROM messages WHERE chat_id = ? AND tenant_id = ? AND is_deleted = false ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(chat_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (ciphertext, iv, kind, created_at) = match last {
+        Some(row) => (
+            row.try_get::<Option<String>, _>("ciphertext")?,
+            row.try_get::<Option<String>, _>("iv")?,
+            Some(row.try_get::<String, _>("type")?),
+            Some(row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?),
+        ),
+        None => (None, None, None, None),
+    };
+    sqlx::query(
+        "UPDATE chats SET last_message_ciphertext = ?, last_message_iv = ?, last_message_type = ?, last_message_at = ?, updated_at = now() WHERE id = ? AND tenant_id = ?",
+    )
+    .bind(ciphertext)
+    .bind(iv)
+    .bind(kind)
+    .bind(created_at)
+    .bind(chat_id)
+    .bind(tenant_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

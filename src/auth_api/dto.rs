@@ -19,6 +19,8 @@ pub(super) struct UserResponse {
     pub role: Role,
     pub email: Option<String>,
     pub device_id: Option<Uuid>,
+    pub photo_url: Option<String>,
+    pub photo_path: Option<String>,
 }
 
 #[derive(Deserialize)]
