@@ -2,6 +2,7 @@ pub mod app;
 pub mod auth;
 pub mod auth_api;
 pub mod chats;
+pub mod child_mutes;
 pub mod config;
 pub mod crypto_api;
 pub mod devices;

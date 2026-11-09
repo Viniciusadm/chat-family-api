@@ -1586,3 +1586,162 @@ async fn realtime_events_are_limited_to_the_chats_of_the_member() {
     family.cleanup(&server).await;
     other.cleanup(&server).await;
 }
+
+async fn send_text(server: &TestServer, token: &str, chat_id: Uuid) -> (StatusCode, Value) {
+    server
+        .post(
+            &format!("/chats/{chat_id}/messages"),
+            token,
+            text_message(Uuid::new_v4()),
+        )
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TEST"]
+async fn a_direct_mute_only_blocks_the_child_in_the_chat_with_that_adult() {
+    let server = server!();
+    let family = seed_family(&server).await;
+    let mute_path = format!("/members/{}/mute", family.child.member_id);
+
+    let (status, group) = server
+        .post(
+            "/chats",
+            &family.adult.token,
+            json!({
+                "name": "Família",
+                "is_group": true,
+                "participant_ids": [family.adult.member_id, family.child.member_id],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let group_id: Uuid = group["id"]
+        .as_str()
+        .expect("group id")
+        .parse()
+        .expect("uuid");
+
+    let (status, mute) = server
+        .call(
+            "PUT",
+            &mute_path,
+            Some(&family.adult.token),
+            Some(json!({ "scope": "direct" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mute["scope"], json!("direct"));
+
+    let (status, body) = send_text(&server, &family.child.token, family.direct_chat_id).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], json!("child_muted"));
+    let (status, _) = send_text(&server, &family.child.token, group_id).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_text(&server, &family.adult.token, family.direct_chat_id).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, mutes) = server.get("/child-mutes", &family.child.token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mutes.as_array().map(Vec::len), Some(1));
+
+    let (status, _) = server
+        .delete(&format!("{mute_path}?scope=direct"), &family.adult.token)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_text(&server, &family.child.token, family.direct_chat_id).await;
+    assert_eq!(status, StatusCode::OK);
+
+    family.cleanup(&server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TEST"]
+async fn a_general_mute_blocks_every_chat_and_any_adult_can_lift_it() {
+    let server = server!();
+    let family = seed_family(&server).await;
+    let other_adult = seed_member(&server, family.tenant_id, chat_back::auth::Role::Adult).await;
+    let mute_path = format!("/members/{}/mute", family.child.member_id);
+
+    let (status, group) = server
+        .post(
+            "/chats",
+            &family.adult.token,
+            json!({
+                "name": "Família",
+                "is_group": true,
+                "participant_ids": [family.adult.member_id, family.child.member_id],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let group_id: Uuid = group["id"]
+        .as_str()
+        .expect("group id")
+        .parse()
+        .expect("uuid");
+
+    let (status, _) = server
+        .call(
+            "PUT",
+            &mute_path,
+            Some(&family.adult.token),
+            Some(json!({ "scope": "all" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for chat_id in [family.direct_chat_id, group_id] {
+        let (status, _) = send_text(&server, &family.child.token, chat_id).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    let (status, _) = server
+        .call(
+            "PUT",
+            &mute_path,
+            Some(&other_adult.token),
+            Some(json!({ "scope": "all" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, mutes) = server.get("/child-mutes", &family.adult.token).await;
+    assert_eq!(mutes.as_array().map(Vec::len), Some(1));
+
+    let (status, _) = server
+        .delete(&format!("{mute_path}?scope=all"), &family.adult.token)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_text(&server, &family.child.token, group_id).await;
+    assert_eq!(status, StatusCode::OK);
+
+    family.cleanup(&server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL_TEST"]
+async fn only_adults_can_mute_and_only_children_can_be_muted() {
+    let server = server!();
+    let family = seed_family(&server).await;
+
+    let (status, _) = server
+        .call(
+            "PUT",
+            &format!("/members/{}/mute", family.child.member_id),
+            Some(&family.child.token),
+            Some(json!({ "scope": "all" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = server
+        .call(
+            "PUT",
+            &format!("/members/{}/mute", family.adult.member_id),
+            Some(&family.adult.token),
+            Some(json!({ "scope": "direct" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    family.cleanup(&server).await;
+}

@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{AuthUser, assert_chat_participant},
+    child_mutes::assert_child_can_send,
     error::{AppError, AppResult},
     realtime::{PendingEvents, emit_tx},
     state::AppState,
@@ -102,6 +103,7 @@ pub(super) async fn create_message(
     Json(req): Json<MessageRequest>,
 ) -> AppResult<Json<Value>> {
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
+    assert_child_can_send(&state.pool, &auth, chat_id).await?;
     validate_message_payload(&req)?;
     let mut tx = state.pool.begin().await?;
     let mut events = PendingEvents::default();
@@ -233,6 +235,7 @@ pub(super) async fn update_message(
     Json(req): Json<MessageRequest>,
 ) -> AppResult<Json<Value>> {
     assert_chat_participant(&state.pool, chat_id, auth.member_id, auth.tenant_id).await?;
+    assert_child_can_send(&state.pool, &auth, chat_id).await?;
     validate_message_payload(&req)?;
     let mut tx = state.pool.begin().await?;
     let mut events = PendingEvents::default();

@@ -10,6 +10,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::devices::routes())
         .merge(crate::members::routes())
         .merge(crate::chats::routes())
+        .merge(crate::child_mutes::routes())
         .merge(crate::media_api::routes())
         .merge(crate::crypto_api::routes())
         .merge(crate::realtime_api::routes())
