@@ -452,7 +452,7 @@ pub(super) async fn mark_chat_read(
     sqlx::query(
         r#"
         INSERT INTO chat_read_state (chat_id, member_id, read_up_to, unread_count)
-        VALUES (?, ?, COALESCE(?, now()), 0)
+        VALUES (?, ?, COALESCE(?, now(6)), 0)
         ON DUPLICATE KEY UPDATE
           read_up_to = GREATEST(COALESCE(read_up_to, VALUES(read_up_to)), VALUES(read_up_to)),
           unread_count = 0

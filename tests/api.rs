@@ -244,6 +244,16 @@ async fn children_cannot_administer_chats() {
 async fn marking_a_chat_read_creates_the_missing_read_state_row() {
     let server = server!();
     let family = seed_family(&server).await;
+    let message_id = Uuid::new_v4();
+    let (status, _) = server
+        .post(
+            &format!("/chats/{}/messages", family.direct_chat_id),
+            &family.adult.token,
+            text_message(message_id),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let created_at = message_field(&server, &family, message_id, "created_at").await;
 
     let (status, _) = server
         .post(
@@ -273,6 +283,17 @@ async fn marking_a_chat_read_creates_the_missing_read_state_row() {
     assert!(
         chat["read_up_to"][family.child.member_id.to_string()].is_string(),
         "the read receipt has to reach the chat payload"
+    );
+    let read_at = chrono::DateTime::parse_from_rfc3339(
+        chat["read_up_to"][family.child.member_id.to_string()]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let created_at = chrono::DateTime::parse_from_rfc3339(created_at.as_str().unwrap()).unwrap();
+    assert!(
+        read_at >= created_at,
+        "a receipt must include messages created in the same second"
     );
 
     let (_, events) = server.get("/realtime/events", &family.adult.token).await;
